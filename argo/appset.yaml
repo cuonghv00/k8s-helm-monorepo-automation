@@ -1,0 +1,76 @@
+# ============================================================================
+#  argo/appset.yaml
+#  ArgoCD ApplicationSet — Auto-discovery for Helm Monorepo
+#
+#  Strategy: Git Directory Generator
+#    Scans the `charts/` directory in this repository.
+#    Each sub-directory that contains a Chart.yaml is treated as a separate
+#    ArgoCD Application and deployed to the target cluster automatically.
+#
+#  Result:
+#    Adding a new app to apps_definition.yaml + running generator.py is all
+#    that's needed — ArgoCD picks it up automatically on the next sync.
+# ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: helm-monorepo-appset
+  namespace: argocd
+  annotations:
+    # Document the generator command so platform engineers know how charts are created
+    helm-monorepo/generator: "scripts/generator.py"
+    helm-monorepo/source-of-truth: "apps_definition.yaml"
+spec:
+  # ---------------------------------------------------------------------------
+  # Generator: scans charts/* and creates one Application per directory found
+  # ---------------------------------------------------------------------------
+  generators:
+    - git:
+        repoURL: "https://gitlab.example.com/your-org/k8s-helm-monorepo-automation.git"  # TODO: replace with real repo URL
+        revision: HEAD
+        directories:
+          # Match every direct sub-directory of charts/
+          - path: "charts/*"
+
+  # ---------------------------------------------------------------------------
+  # Application template: rendered once per directory matched above
+  # The `path` variable is injected by the generator (e.g. "charts/api-gateway")
+  # The `path.basename` variable gives the directory name (e.g. "api-gateway")
+  # ---------------------------------------------------------------------------
+  template:
+    metadata:
+      # Application name mirrors the chart directory name for easy correlation
+      name: "{{path.basename}}"
+      namespace: argocd
+      labels:
+        # Helps ArgoCD UI filtering and is useful for automated queries
+        app.kubernetes.io/managed-by: helm-monorepo-generator
+        app.kubernetes.io/part-of: my-platform
+    spec:
+      project: default   # TODO: replace with your ArgoCD project name if not using default
+
+      # Source: point directly at the child chart directory
+      source:
+        repoURL: "https://gitlab.example.com/your-org/k8s-helm-monorepo-automation.git"  # TODO: replace
+        targetRevision: HEAD
+        path: "{{path}}"                  # e.g. charts/api-gateway
+        helm:
+          # Merge values.yaml (static config) with images.yaml (CI-managed tag)
+          # Order matters: images.yaml is loaded last so it overrides values.yaml
+          valueFiles:
+            - values.yaml
+            - images.yaml
+
+      # Destination: deploy each app into its own namespace (namespace = app name)
+      destination:
+        server: https://kubernetes.default.svc   # In-cluster target; change for remote clusters
+        namespace: "{{path.basename}}"           # e.g. api-gateway
+
+      # Sync policy: automated with self-healing and namespace auto-creation
+      syncPolicy:
+        automated:
+          prune: true      # Remove Kubernetes resources deleted from Git
+          selfHeal: true   # Revert out-of-band manual changes automatically
+        syncOptions:
+          - CreateNamespace=true   # Auto-create namespace if it doesn't exist
+          - ServerSideApply=true   # Use SSA to avoid annotation size limits

@@ -1,0 +1,35 @@
+type: deployment
+image:
+  repository: registry.vn/user-service
+  tag: latest
+  pullPolicy: IfNotPresent
+deployment:
+  replicas: 2
+  containerPort: 8081
+  resources: {}
+  strategy:
+    type: RollingUpdate
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    capabilities:
+      drop:
+      - ALL
+  env: []
+  volumes:
+  - name: user-service-tmp
+    emptyDir: {}
+  volumeMounts:
+  - name: user-service-tmp
+    mountPath: /tmp
+  affinity: {}
+serviceAccount:
+  create: false
+  name: ''
+service:
+  enabled: true
+  type: ClusterIP
+  port: 8081
+ingress: {}

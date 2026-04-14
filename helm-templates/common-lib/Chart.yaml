@@ -1,0 +1,7 @@
+apiVersion: v2
+name: common-lib
+description: |
+  Shared Library Chart for all microservices in the platform.
+  Provides reusable templates following the DRY (Don't Repeat Yourself) principle.
+type: library
+version: 1.0.0
