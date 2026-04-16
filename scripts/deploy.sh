@@ -3,8 +3,9 @@
 # ==============================================================================
 # Automates the Helm Monorepo deployment pipeline:
 # 1. Generates Helm charts for a specific project and environment.
-# 2. Checks for Git changes in the generated charts.
-# 3. Commits and pushes changes back to the repository (Write-back GitOps).
+# 2. Performs 'helm lint' only on charts that have changed.
+# 3. Checks for Git changes in the generated charts.
+# 4. Commits and pushes changes back to the repository (Write-back GitOps).
 #
 # Usage: ./deploy.sh --project <name> --env <dev|stg|prod> [--dry-run]
 # ==============================================================================
@@ -44,19 +45,45 @@ echo "-------------------------------"
 
 # 1. Run the Generator
 echo "▶ Running Generator..."
-GEN_CMD="python3 scripts/generator.py --project ${PROJECT} --env ${ENV}"
+PYTHON_BIN="python3"
+if [ -f "./.venv/bin/python3" ]; then
+    PYTHON_BIN="./.venv/bin/python3"
+    echo "  - Using virtual environment: .venv"
+fi
+
+GEN_CMD="${PYTHON_BIN} scripts/generator.py --project ${PROJECT} --env ${ENV}"
 if [ ! -z "$IMAGE_TAG" ]; then
     GEN_CMD="${GEN_CMD} --image-tag ${IMAGE_TAG}"
 fi
 $GEN_CMD
 
-# 2. Check for Git Changes
-TARGET_DIR="projects/${PROJECT}/charts"
+# 2. Validate with Helm Lint (Optimized: Only changed charts)
+TARGET_DIR="projects/${ENV}/${PROJECT}/charts"
 if [ ! -d "$TARGET_DIR" ]; then
     echo "ERROR: Target directory ${TARGET_DIR} does not exist after generation."
     exit 1
 fi
 
+echo "▶ Detecting changed charts for validation..."
+# Get a list of directories within TARGET_DIR that have git changes
+CHANGED_CHARTS=$(git status --porcelain "$TARGET_DIR" | awk '{print $2}' | cut -d/ -f1-5 | sort -u)
+
+if [ -z "$CHANGED_CHARTS" ]; then
+    echo "  - No changes in charts detected. Skipping linting."
+else
+    for chart_path in $CHANGED_CHARTS; do
+        if [ -d "$chart_path" ] && [ -f "$chart_path/Chart.yaml" ]; then
+            chart_name=$(basename "$chart_path")
+            echo "  - Validating chart: $chart_name"
+            echo "    - Updating dependencies..."
+            helm dependency update "$chart_path" > /dev/null
+            echo "    - Running helm lint..."
+            helm lint "$chart_path"
+        fi
+    done
+fi
+
+# 3. Check for Git Changes (General for the whole project)
 CHANGES=$(git status --porcelain "$TARGET_DIR")
 
 if [ -z "$CHANGES" ]; then
@@ -67,49 +94,41 @@ fi
 echo "▶ Changes detected in ${TARGET_DIR}:"
 echo "${CHANGES}"
 
-# 3. Commit and Push (Write-back)
+# 4. Commit and Push (Write-back)
 if [ "$DRY_RUN" = true ]; then
     echo "⚠️  Dry-run mode: Skipping Git commit and push."
     exit 0
 fi
 
 echo "▶ Committing changes..."
-# Configure local bot user for this commit
 git config user.name "${GIT_USER}"
 git config user.email "${GIT_EMAIL}"
 
 git add "$TARGET_DIR"
-# Check if there are actual changes before committing
 if git diff-index --quiet HEAD --; then
     echo "ℹ No changes detected in charts. Skipping commit."
     SUCCESS=true
 else
-    # [skip ci] prevents the CI from entering an infinite loop when this script pushes back
     git commit -m "chore(ops): update generated charts for ${PROJECT} (${ENV}) [skip ci]"
-
     echo "▶ Pushing changes to origin (with retry logic)..."
     MAX_RETRIES=5
     RETRY_COUNT=0
     SUCCESS=false
-
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-        # Pull latest changes and rebase our commit on top to avoid conflicts
         if git pull --rebase origin HEAD; then
             if git push origin HEAD; then
                 SUCCESS=true
                 break
             fi
         fi
-        
         RETRY_COUNT=$((RETRY_COUNT + 1))
-        echo "⚠️  Push failed (likely concurrent update). Retrying in 5s... ($RETRY_COUNT/$MAX_RETRIES)"
+        echo "⚠️  Push failed. Retrying in 5s... ($RETRY_COUNT/$MAX_RETRIES)"
         sleep 5
     done
 fi
 
 if [ "$SUCCESS" = true ]; then
     echo "✅ Deployment manifests successfully updated in Git."
-    echo "   ArgoCD will now detect and sync these changes."
 else
     echo "❌ ERROR: Failed to push changes after $MAX_RETRIES attempts."
     exit 1

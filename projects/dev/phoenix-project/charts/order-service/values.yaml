@@ -1,0 +1,101 @@
+type: deployment
+image:
+  repository: registry.vn/phoenix-project/order-service
+  tag: latest
+  pullPolicy: IfNotPresent
+deployment:
+  replicas: 1
+  containerPort: 8080
+  ports:
+  - name: http
+    containerPort: 8080
+    protocol: TCP
+  - name: grpc
+    containerPort: 50051
+    protocol: TCP
+  resources: {}
+  strategy:
+    type: RollingUpdate
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    capabilities:
+      drop:
+      - ALL
+  envFrom:
+  - configMapRef:
+      name: phoenix-project-config
+  env: []
+  volumes:
+  - name: tmp
+    emptyDir: {}
+  volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  affinity: {}
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    httpGet:
+      path: /health
+      port: 8080
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    tcpSocket:
+      port: 8080
+  startupProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    tcpSocket:
+      port: 8080
+  imagePullSecrets:
+  - name: regcred
+  podAnnotations: {}
+serviceAccount:
+  create: true
+  name: null
+  automountServiceAccountToken: false
+service:
+  enabled: true
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+    nodePort: null
+  - name: grpc
+    port: 50051
+    targetPort: 50051
+    protocol: TCP
+    nodePort: null
+  annotations: {}
+ingress:
+  enabled: true
+  host: orders.phoenix-project.vn
+  servicePort: http
+  annotations: {}
+  className: nginx
+  hosts:
+  - host: orders.phoenix-project.vn
+    paths:
+    - path: /
+      pathType: ImplementationSpecific
+      servicePort: http
+pvc:
+  enabled: false
+  size: 10Gi
+  accessModes:
+  - ReadWriteOnce
+localConfig:
+  enabled: false

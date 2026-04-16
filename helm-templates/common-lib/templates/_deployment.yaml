@@ -37,6 +37,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "common-lib.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken | default false }}
       securityContext:
         {{- toYaml (.Values.deployment.podSecurityContext | default dict) | nindent 8 }}
       containers:
@@ -45,13 +46,16 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # Image tag is sourced from images.yaml (updated by CI) and falls back to Chart.AppVersion
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
           ports:
+            {{- if .Values.deployment.ports }}
+            {{- toYaml .Values.deployment.ports | nindent 12 }}
+            {{- else }}
             - name: http
               containerPort: {{ .Values.deployment.containerPort | default 80 }}
               protocol: TCP
+            {{- end }}
           {{- with .Values.deployment.env }}
           env:
             {{- toYaml . | nindent 12 }}
@@ -67,6 +71,10 @@ spec:
           {{- if .Values.deployment.readinessProbe }}
           readinessProbe:
             {{- toYaml .Values.deployment.readinessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.deployment.startupProbe }}
+          startupProbe:
+            {{- toYaml .Values.deployment.startupProbe | nindent 12 }}
           {{- end }}
           resources:
             {{- toYaml (.Values.deployment.resources | default dict) | nindent 12 }}

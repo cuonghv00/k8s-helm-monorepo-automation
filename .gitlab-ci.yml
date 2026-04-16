@@ -33,12 +33,12 @@ sync-vault-secrets:
   extends: .base-script
   script:
     - chmod +x scripts/vault_sync.sh
-    # New syntax: ./vault_sync.sh <vault_path> <secret_name> <namespace>
+    # New syntax includes the env in the path
     - ./scripts/vault_sync.sh "secret/data/${TEAM}/${PROJECT}/${ENV}" "${PROJECT}-secret" "${PROJECT}"
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes:
-        - projects/$PROJECT/apps.$ENV.yaml
+        - projects/$ENV/$PROJECT/apps.$ENV.yaml
         - scripts/vault_sync.sh
 
 # 2. Orchestrate Deployment (Generate, Commit, and Push back)
@@ -53,7 +53,7 @@ deploy-orchestration:
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes:
-        - projects/$PROJECT/apps.$ENV.yaml
+        - projects/$ENV/$PROJECT/apps.$ENV.yaml
         - helm-templates/**/*
         - scripts/deploy.sh
         - scripts/generator.py

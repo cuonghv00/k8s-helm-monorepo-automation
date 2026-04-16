@@ -18,10 +18,14 @@ metadata:
 spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
+    {{- if .Values.service.ports }}
+    {{- toYaml .Values.service.ports | nindent 4 }}
+    {{- else }}
     - port: {{ .Values.service.port | default 80 }}
-      targetPort: {{ .Values.service.targetPort | default (.Values.deployment.containerPort | default 80) }}
+      targetPort: {{ .Values.service.targetPort | default 80 }}
       protocol: TCP
       name: http
+    {{- end }}
   selector:
     {{- include "common-lib.selectorLabels" . | nindent 4 }}
 {{- end }}

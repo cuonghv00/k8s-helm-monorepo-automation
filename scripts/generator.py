@@ -4,408 +4,193 @@ generator.py
 ============
 The Python "Engine" for the Helm Monorepo Automation System.
 
-Reads apps_definition.yaml (Single Source of Truth) and for each app:
-  1. Creates/updates the directory at charts/<app-name>/
+Reads apps.{env}.yaml (Single Source of Truth) and for each app:
+  1. Creates/updates the directory at projects/{env}/{project}/charts/<app-name>/
   2. Generates Chart.yaml with a file:// dependency on common-lib
   3. Generates values.yaml mapping app config to common-lib value keys
-  4. Creates an empty images.yaml if it does not already exist (CI writes to it)
 
 Design principle: IDEMPOTENT — safe to run multiple times without side effects.
-
-Usage:
-  # Single-project mode (root-level, default):
-  python3 scripts/generator.py [--dry-run]
-
-  # Multi-project mode (one sub-directory per project under projects/):
-  python3 scripts/generator.py --project <name> [--dry-run]
-
-  # Advanced: fully custom paths (overrides --project):
-  python3 scripts/generator.py --definition PATH --output-dir DIR [--dry-run]
-
-Requirements:
-  pip install -r scripts/requirements.txt
 """
 
 import argparse
 import sys
+import re
 from pathlib import Path
+from typing import Optional, Union, Any
 
 import yaml
+from pydantic import BaseModel, Field, RootModel, ConfigDict, model_validator
 
 # ---------------------------------------------------------------------------
-# Paths (relative to repo root, resolved at runtime)
+# Constants & Defaults
 # ---------------------------------------------------------------------------
+DEFAULT_REGISTRY = "registry.vn/platform"
+DEFAULT_PULL_SECRET = "regcred"
+COMMON_LIB_REL_PATH = "../../../../../helm-templates/common-lib"
+
+# ---------------------------------------------------------------------------
+# Pydantic Models for Configuration Validation
+# ---------------------------------------------------------------------------
+
+class IngressPath(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    path: str = "/"
+    pathType: str = "ImplementationSpecific"
+    servicePort: Optional[Union[int, str]] = None 
+
+class IngressHost(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    host: str
+    paths: list[IngressPath] = Field(default_factory=lambda: [IngressPath()])
+
+class IngressConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool = False
+    host: Optional[str] = None 
+    path: Optional[str] = None # Shortcut
+    hosts: Optional[list[IngressHost]] = None
+    servicePort: Optional[Union[int, str]] = None
+    annotations: dict[str, str] = Field(default_factory=dict)
+    className: str = "nginx"
+
+class ProbeConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    path: Optional[str] = None
+    port: Optional[Union[int, str]] = None
+    initialDelaySeconds: int = 10
+    periodSeconds: int = 5
+    timeoutSeconds: int = 2
+    failureThreshold: int = 3
+
+class HealthConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool = False
+    path: Optional[str] = None
+    port: Optional[Union[int, str]] = None
+    initialDelaySeconds: int = 10
+    periodSeconds: int = 5
+    timeoutSeconds: int = 2
+    failureThreshold: int = 3
+    liveness: Optional[Union[str, ProbeConfig]] = None
+    readiness: Optional[Union[str, ProbeConfig]] = None
+    startup: Optional[Union[str, ProbeConfig]] = None
+
+class PVCConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool = False
+    size: str = "10Gi"
+    storageClass: Optional[str] = None
+    accessModes: list[str] = Field(default_factory=lambda: ["ReadWriteOnce"])
+    mountPath: Optional[str] = None
+
+class ServicePort(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str = "http"
+    port: int
+    targetPort: Optional[int] = None
+    protocol: str = "TCP"
+    nodePort: Optional[int] = None
+
+class ServiceAccountConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    create: bool = True
+    automountToken: bool = False # Hardened default (RBAC Security)
+    name: Optional[str] = None
+
+class ServiceConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool = True
+    type: str = "ClusterIP"
+    port: Optional[int] = None # Shortcut
+    targetPort: Optional[int] = None # Shortcut
+    ports: list[ServicePort] = Field(default_factory=list)
+    annotations: dict[str, str] = Field(default_factory=dict)
+
+class AppConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    
+    name: str
+    type: str = "deployment"
+    
+    port: Optional[int] = None
+    ports: list[ServicePort] = Field(default_factory=list)
+    
+    replicas: int = 1
+    image: Optional[str] = None
+    image_repo: Optional[str] = None
+    image_tag: Optional[str] = None
+    pullPolicy: str = "IfNotPresent"
+    imagePullSecrets: Optional[list[dict]] = None
+    
+    resources: dict = Field(default_factory=dict)
+    securityContext: dict = Field(default_factory=dict)
+    auto_mount_tmp: bool = True
+    mount_env_file: bool = False
+    
+    env: list[dict] = Field(default_factory=list)
+    env_vars: list[str] = Field(default_factory=list)
+    envFrom: list[dict] = Field(default_factory=list)
+    
+    service: Optional[Union[bool, ServiceConfig]] = None
+    ingress: IngressConfig = Field(default_factory=IngressConfig)
+    health: HealthConfig = Field(default_factory=HealthConfig)
+    pvc: PVCConfig = Field(default_factory=PVCConfig)
+    serviceAccount: ServiceAccountConfig = Field(default_factory=ServiceAccountConfig)
+    
+    strategy: str = "RollingUpdate"
+    affinity: dict = Field(default_factory=dict)
+    tolerations: list = Field(default_factory=list)
+    serviceAccountName: Optional[str] = None # For compatibility, prefer serviceAccount.name
+    genConfigMaps: bool = False
+    podAnnotations: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def validate_ports_uniqueness(self) -> 'AppConfig':
+        names = [p.name for p in self.ports]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Duplicate port names detected in app '{self.name}': {names}")
+        
+        ports = [p.port for p in self.ports]
+        if len(ports) != len(set(ports)):
+            raise ValueError(f"Duplicate port numbers detected in app '{self.name}': {ports}")
+        
+        return self
+
+class ProjectDefinition(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    project: str
+    common_version: str = "1.0.0"
+    namespace: Optional[str] = None
+    image_repo: Optional[str] = None
+    image_tag: str = "latest"
+    imagePullSecrets: Optional[list[dict]] = None
+    apps: list[AppConfig] = Field(default_factory=list)
+
+# ---------------------------------------------------------------------------
+# File Utilities
+# ---------------------------------------------------------------------------
+
 REPO_ROOT = Path(__file__).parent.parent
-APPS_DEFINITION_DEFAULT = REPO_ROOT / "apps_definition.yaml"
 COMMON_LIB_PATH = REPO_ROOT / "helm-templates" / "common-lib"
 
-# Global state updated in main()
-CHARTS_DIR = REPO_ROOT / "charts"
-COMMON_LIB_REL = "../../helm-templates/common-lib"
-
-
-# ---------------------------------------------------------------------------
-# Template builders
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Template builders
-# ---------------------------------------------------------------------------
-
 def parse_env_file(env_path: Path) -> tuple[dict, list]:
-    """
-    Parses a .env file and classifies variables:
-    - Literals (KEY=VALUE) -> ConfigMap
-    - Placeholders (KEY=${VAR}) -> Secret
-    """
     config_data = {}
     secret_keys = []
-    
-    if not env_path.exists():
-        return config_data, secret_keys
-
-    import re
-    # Pattern to match KEY=VALUE
+    if not env_path.exists(): return config_data, secret_keys
     pattern = re.compile(r"^\s*([\w.-]+)\s*=\s*(.*)\s*$")
-    
     with env_path.open() as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            
+            if not line or line.startswith("#"): continue
             match = pattern.match(line)
             if match:
                 key, value = match.groups()
-                # Remove quotes if present
                 value = value.strip("'\"")
-                
-                if value.startswith("${") and value.endswith("}"):
-                    secret_keys.append(key)
-                else:
-                    config_data[key] = value
-                    
+                if value.startswith("${") and value.endswith("}"): secret_keys.append(key)
+                else: config_data[key] = value
     return config_data, secret_keys
 
-
-def build_chart_yaml(app_name: str, common_version: str, is_shared: bool = False) -> dict:
-    """
-    Builds the Chart.yaml content for a child application chart or shared chart.
-    """
-    desc = f"Shared resources for project {app_name}" if is_shared else f"Application chart for {app_name}"
-    return {
-        "apiVersion": "v2",
-        "name": app_name,
-        "description": f"{desc} — managed by generator.py",
-        "type": "application",
-        "version": "0.1.0",
-        "dependencies": [
-            {
-                "name": "common-lib",
-                "version": common_version,
-                "repository": f"file://{COMMON_LIB_REL}",
-                "alias": "common-lib",
-            }
-        ],
-    }
-
-
-def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict, list], image_tag: str = None) -> dict:
-    """
-    Constructs the values.yaml content for a specific app based on defaults and overrides.
-    """
-    config_pool, secret_pool = project_vars
-    project_name = global_defaults.get("project", "default")
-    
-    # 1. Merge nested 'config' and handle K8s-style 'containers' for flexibility
-    cfg = app.get("config", {})
-    
-    container_cfg = {}
-    if "containers" in app:
-        containers = app["containers"]
-        if isinstance(containers, list) and len(containers) > 0:
-            container_cfg = containers[0]
-        elif isinstance(containers, dict):
-            container_cfg = containers
-
-    full_app = {**app, **cfg, **container_cfg}
-    app_name = full_app.get("name")
-    
-    # 2. Image construction
-    image_repo = full_app.get("image_repo") or global_defaults.get("image_repo", "registry.example.com")
-    image_override = full_app.get("image")
-    
-    # Priority for Tag: 1. CLI Arg (image_tag), 2. App definition, 3. Global default, 4. 'latest'
-    tag = image_tag or full_app.get("image_tag") or global_defaults.get("image_tag") or "latest"
-    
-    if image_override:
-        image_name = image_override
-    else:
-        image_name = f"{image_repo}/{app_name}"
-
-    # 3. Base Security Context (Maximum Hardening)
-    default_sec_ctx = {
-        "readOnlyRootFilesystem": True,
-        "allowPrivilegeEscalation": False,
-        "runAsNonRoot": True,
-        "runAsUser": 1000,
-        "runAsGroup": 1000,
-        "capabilities": {"drop": ["ALL"]}
-    }
-    
-    # Merge override logic
-    sec_ctx = {**default_sec_ctx, **full_app.get("securityContext", {})}
-
-    # 4. Volumes and Temp Mount
-    volumes = full_app.get("volumes", [])
-    volume_mounts = full_app.get("volumeMounts", [])
-    
-    # Auto-mount /tmp by default to prevent application crash on R/O FS
-    if sec_ctx.get("readOnlyRootFilesystem") and full_app.get("auto_mount_tmp", True):
-        tmp_vol_name = "tmp"
-        if not any(v.get("name") == tmp_vol_name for v in volumes):
-            volumes.append({"name": tmp_vol_name, "emptyDir": {}})
-            volume_mounts.append({"name": tmp_vol_name, "mountPath": "/tmp"})
-
-    # Check if app needs to mount the whole shared env file
-    if full_app.get("mount_env_file"):
-        cm_name = f"{project_name}-config"
-        volume_mounts.append({
-            "name": "env-file",
-            "mountPath": "/app/.env",
-            "subPath": ".env"
-        })
-        volumes.append({
-            "name": "env-file",
-            "configMap": {"name": cm_name}
-        })
-
-    # 5. Health Check (v3 Hierarchical Logic)
-    health_cfg = full_app.get("health", {})
-    health_enabled = health_cfg.get("enabled", False)
-    
-    liveness = None
-    readiness = None
-
-    if health_enabled:
-        app_port = full_app.get("port", 80)
-        
-        # Base parameters for all probes
-        base_params = {
-            "path": health_cfg.get("path"),  # No default here, let build_probe decide
-            "port": health_cfg.get("port") or app_port,
-            "initialDelaySeconds": health_cfg.get("initialDelaySeconds", 10),
-            "periodSeconds": health_cfg.get("periodSeconds", 5),
-            "timeoutSeconds": health_cfg.get("timeoutSeconds", 2),
-            "failureThreshold": health_cfg.get("failureThreshold", 3)
-        }
-
-        def build_probe(type_key: str):
-            # Check for top-level probe definition first (v1 style)
-            explicit_probe = full_app.get(f"{type_key}Probe")
-            if explicit_probe:
-                return explicit_probe
-
-            # Helper to merge: base_params < health_cfg < health[type_key]
-            type_cfg = health_cfg.get(type_key, {})
-            if isinstance(type_cfg, str): # Handle short-form: liveness: "/healthz"
-                type_cfg = {"path": type_cfg}
-            
-            merged = {**base_params, **type_cfg}
-            
-            probe_def = {
-                "initialDelaySeconds": merged["initialDelaySeconds"],
-                "periodSeconds": merged["periodSeconds"],
-                "timeoutSeconds": merged["timeoutSeconds"],
-                "failureThreshold": merged["failureThreshold"]
-            }
-
-            # Switch between HTTP and TCP based on presence of path
-            if merged.get("path"):
-                probe_def["httpGet"] = {"path": merged["path"], "port": merged["port"]}
-            else:
-                probe_def["tcpSocket"] = {"port": merged["port"]}
-
-            return probe_def
-
-        liveness = build_probe("liveness")
-        readiness = build_probe("readiness")
-
-    # 6. Environment Variables Mapping (Shared Resources aware)
-    # ... (rest of the logic remains same, just ensuring we don't output nulls later)
-
-    # 6. Environment Variables Mapping (Shared Resources aware)
-    env_list = full_app.get("env", [])
-    env_keys = full_app.get("env_vars", []) # New simplified key
-    
-    # 6. Service & Storage (PVC) Configuration
-    svc_cfg = full_app.get("service", {})
-    ingress_cfg = full_app.get("ingress", {})
-    pvc_cfg = full_app.get("pvc", {})
-    app_port = full_app.get("port", 80)
-
-    # 6a. Storage (PVC) logic
-    if pvc_cfg.get("enabled"):
-        # Auto-configure volumes/mounts if mountPath is provided
-        mount_path = pvc_cfg.get("mountPath")
-        if mount_path:
-            # Add to volumes
-            volumes.append({
-                "name": "data-volume",
-                "persistentVolumeClaim": {
-                    "claimName": "{{ include \"common-lib.fullname\" . }}"
-                }
-            })
-            # Add to volumeMounts
-            volume_mounts.append({
-                "name": "data-volume",
-                "mountPath": mount_path
-            })
-        
-        # Ensure default PVC settings
-        if "accessModes" not in pvc_cfg:
-            pvc_cfg["accessModes"] = ["ReadWriteOnce"]
-        if "size" not in pvc_cfg:
-            pvc_cfg["size"] = "10Gi"
-    
-    # Auto-enable service if ingress is present or service block is present
-    if (ingress_cfg.get("enabled") or svc_cfg) and not svc_cfg:
-        svc_cfg = {}
-
-    if svc_cfg or ingress_cfg.get("enabled"):
-        # Port precedence: service.port > ingress.servicePort > app_port
-        resolved_svc_port = svc_cfg.get("port") or ingress_cfg.get("servicePort") or app_port
-        target_port = svc_cfg.get("targetPort") or app_port
-        
-        new_svc_cfg = {
-            "type": svc_cfg.get("type", "ClusterIP"),
-            "port": resolved_svc_port,
-            "targetPort": target_port
-        }
-        
-        if new_svc_cfg["type"] == "NodePort" and "nodePort" in svc_cfg:
-            new_svc_cfg["nodePort"] = svc_cfg["nodePort"]
-            
-        svc_cfg = new_svc_cfg
-        svc_final_port = resolved_svc_port
-    else:
-        svc_final_port = 80
-
-    container_port = app_port
-
-    # 7. Ingress Transformation (Simplified -> Standard)
-    if ingress_cfg.get("enabled"):
-        # If user used the simplified 'host' field, convert it to the library standard
-        if "host" in ingress_cfg and "hosts" not in ingress_cfg:
-            simple_host = ingress_cfg.pop("host")
-            ingress_cfg["hosts"] = [{
-                "host": simple_host,
-                "paths": [{
-                    "path": "/",
-                    "pathType": "ImplementationSpecific"
-                }]
-            }]
-        
-        # Ensure ingress points to the correct service port
-        if "hosts" in ingress_cfg:
-            for host_entry in ingress_cfg["hosts"]:
-                for path_entry in host_entry.get("paths", []):
-                    path_entry["servicePort"] = svc_final_port
-
-    # 8. Shared Resources via envFrom (ConfigMap only as requested)
-    # Start with the smart default (shared project config)
-    env_from = [
-        {"configMapRef": {"name": f"{project_name}-config"}}
-    ]
-    
-    # Allow additional envFrom entries from the app definition
-    extra_env_from = full_app.get("envFrom", [])
-    if isinstance(extra_env_from, list):
-        env_from.extend(extra_env_from)
-
-    # 9. Environment Variables Mapping (Secrets & Overrides)
-    env_list = full_app.get("env", [])
-    env_keys = full_app.get("env_vars", [])
-    
-    for key in env_keys:
-        # We keep secrets explicit in the env list as requested
-        if key in secret_pool:
-            env_list.append({
-                "name": key,
-                "valueFrom": {
-                    "secretKeyRef": {
-                        "name": f"{project_name}-secret",
-                        "key": key
-                    }
-                }
-            })
-        # Note: We skip config_pool keys because they are already covered by envFrom above
-
-    # 10. Image Pull Secrets
-    # Priority: app.imagePullSecrets > global_defaults.imagePullSecrets > default [{"name": "regcred"}]
-    image_pull_secrets = full_app.get("imagePullSecrets") or global_defaults.get("imagePullSecrets") or [{"name": "regcred"}]
-
-    deployment_data = {
-        "replicas": full_app.get("replicas", 1),
-        "containerPort": container_port,
-        "resources": full_app.get("resources", {}),
-        "strategy": {"type": full_app.get("strategy", "RollingUpdate")},
-        "securityContext": sec_ctx,
-        "imagePullSecrets": image_pull_secrets,
-        "envFrom": env_from,
-        "env": env_list,
-        "volumes": volumes,
-        "volumeMounts": volume_mounts,
-        "affinity": full_app.get("affinity", {})
-    }
-    
-    # Only add probes if they are configured
-    if liveness:
-        deployment_data["livenessProbe"] = liveness
-    if readiness:
-        deployment_data["readinessProbe"] = readiness
-
-    values: dict = {
-        "type": full_app.get("type", "deployment"),
-        "image": {
-            "repository": image_name,
-            "tag": tag,
-            "pullPolicy": full_app.get("pullPolicy", "IfNotPresent"),
-        },
-        "deployment": deployment_data,
-        "serviceAccount": {
-            "create": False,
-            "name": full_app.get("serviceAccount", "default"),
-        },
-        "service": svc_cfg,
-        "ingress": full_app.get("ingress", {}),
-        "pvc": pvc_cfg,
-        "localConfig": {
-            "enabled": full_app.get("genConfigMaps", False)
-        }
-    }
-
-    return values
-
-
-def build_images_yaml() -> dict:
-    """
-    Stub file written once. CI pipeline updates image.tag here via
-    the GitLab Commits API without touching values.yaml (avoids merge conflicts).
-    """
-    return {
-        "image": {
-            "tag": "latest",
-        }
-    }
-
-
-# ---------------------------------------------------------------------------
-# File I/O helpers
-# ---------------------------------------------------------------------------
-
 def write_yaml(path: Path, data: dict, dry_run: bool = False) -> None:
-    """Writes a dict as YAML to the given path. Skips write in dry-run mode."""
     content = yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
     if dry_run:
         print(f"  [DRY-RUN] Would write: {path}")
@@ -414,230 +199,186 @@ def write_yaml(path: Path, data: dict, dry_run: bool = False) -> None:
         path.write_text(content)
         print(f"  [WRITE]   {path}")
 
-
 def ensure_dir(path: Path, dry_run: bool = False) -> None:
-    """Creates a directory (and parents) if it doesn't exist."""
     if not path.exists():
-        if dry_run:
-            print(f"  [DRY-RUN] Would create directory: {path}")
-        else:
-            path.mkdir(parents=True, exist_ok=True)
-            print(f"  [MKDIR]   {path}")
-    else:
-        print(f"  [EXISTS]  {path}")
-
+        if not dry_run: path.mkdir(parents=True, exist_ok=True)
+        print(f"  [MKDIR]   {path}")
 
 # ---------------------------------------------------------------------------
-# Core generator logic
+# Logic Builders
 # ---------------------------------------------------------------------------
 
-ALL_YAML_CONTENT = """\
-{{/*
-  all.yaml — Auto-generated by scripts/generator.py. Do NOT edit manually.
-  Calls the common-lib.main router which renders the correct Kubernetes
-  resource based on .Values.type defined in values.yaml.
-*/}}
-{{ include "common-lib.main" . }}
-"""
-
-
-def generate_shared_chart(global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False) -> None:
-    """Generates the project-shared chart containing shared ConfigMap and Secret template."""
-    project_name = global_defaults["project"]
-    common_version = global_defaults["common_version"]
+def build_values_yaml(app: AppConfig, project: ProjectDefinition, project_vars: tuple[dict, list], image_tag: str = None) -> dict:
     config_pool, secret_pool = project_vars
+    project_name = project.project
     
-    chart_dir = CHARTS_DIR / "project-shared"
+    # 1. Resolve Ports
+    all_ports = app.ports.copy()
+    if app.port and not any(p.port == app.port for p in all_ports):
+        # Fallback for old single 'port' config
+        all_ports.insert(0, ServicePort(name="http", port=app.port))
     
-    print(f"\n▶  Generating shared resources: project-shared")
-    ensure_dir(chart_dir, dry_run)
-    ensure_dir(chart_dir / "templates", dry_run)
-    
-    # 1. Chart.yaml
-    write_yaml(chart_dir / "Chart.yaml", build_chart_yaml(f"{project_name}-shared", common_version, is_shared=True), dry_run)
-    
-    # 2. ConfigMap template
-    cm_data = {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": f"{project_name}-config",
+    if not all_ports:
+        all_ports.append(ServicePort(name="http", port=80))
+
+    # Port resolution for different contexts
+    primary_svc_port = all_ports[0].port
+    primary_container_port = all_ports[0].targetPort or all_ports[0].port
+
+    # 2. Image logic
+    image_repo = app.image_repo or project.image_repo or DEFAULT_REGISTRY
+    tag = image_tag or app.image_tag or project.image_tag
+    image_name = app.image if app.image else f"{image_repo}/{app.name}"
+
+    # 3. Security & Volumes
+    default_sec_ctx = {
+        "readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False,
+        "runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
+        "capabilities": {"drop": ["ALL"]}
+    }
+    sec_ctx = {**default_sec_ctx, **app.securityContext}
+    volumes, volume_mounts = [], []
+    if sec_ctx.get("readOnlyRootFilesystem") and app.auto_mount_tmp:
+        volumes.append({"name": "tmp", "emptyDir": {}})
+        volume_mounts.append({"name": "tmp", "mountPath": "/tmp"})
+    if app.mount_env_file:
+        volumes.append({"name": "env-file", "configMap": {"name": f"{project_name}-config"}})
+        volume_mounts.append({"name": "env-file", "mountPath": "/app/.env", "subPath": ".env"})
+    if app.pvc.enabled and app.pvc.mountPath:
+        volumes.append({"name": "data-volume", "persistentVolumeClaim": {"claimName": '{{ include "common-lib.fullname" . }}'}})
+        volume_mounts.append({"name": "data-volume", "mountPath": app.pvc.mountPath})
+
+    # 4. Probes
+    liveness, readiness, startup = None, None, None
+    if app.health.enabled:
+        def make_probe(cfg_union: Union[str, ProbeConfig, None]):
+            if not cfg_union: p = ProbeConfig(path=app.health.path, port=app.health.port or primary_container_port)
+            elif isinstance(cfg_union, str): p = ProbeConfig(path=cfg_union, port=app.health.port or primary_container_port)
+            else:
+                p = cfg_union
+                if not p.port: p.port = app.health.port or primary_container_port
+                if not p.path: p.path = app.health.path
+            res = {"initialDelaySeconds": p.initialDelaySeconds, "periodSeconds": p.periodSeconds, "timeoutSeconds": p.timeoutSeconds, "failureThreshold": p.failureThreshold}
+            if p.path: res["httpGet"] = {"path": p.path, "port": p.port}
+            else: res["tcpSocket"] = {"port": p.port}
+            return res
+        liveness, readiness, startup = make_probe(app.health.liveness), make_probe(app.health.readiness), make_probe(app.health.startup)
+
+    # 5. Service Configuration
+    svc_values = {"enabled": False}
+    svc_enabled = (app.service is not False) and (app.service is not None or app.ingress.enabled)
+    if svc_enabled:
+        s = app.service if isinstance(app.service, ServiceConfig) else ServiceConfig()
+        svc_ports = []
+        source_ports = s.ports.copy()
+        if s.port and not any(p.port == s.port for p in source_ports):
+            source_ports.insert(0, ServicePort(name="http", port=s.port, targetPort=s.targetPort))
+        for p in (source_ports if source_ports else all_ports):
+            svc_ports.append({"name": p.name, "port": p.port, "targetPort": p.targetPort or p.port, "protocol": p.protocol, "nodePort": p.nodePort})
+        svc_values = {"enabled": True, "type": s.type, "ports": svc_ports, "annotations": s.annotations}
+
+    # 6. Ingress Configuration
+    ing_values = {"enabled": False}
+    if app.ingress.enabled:
+        ing_values = app.ingress.model_dump(exclude_none=True)
+        if app.ingress.host and not app.ingress.hosts:
+            ing_values["hosts"] = [{"host": app.ingress.host, "paths": [{"path": app.ingress.path or "/", "pathType": "ImplementationSpecific"}]}]
+        default_svc_port = app.ingress.servicePort or svc_ports[0]["port"] if svc_enabled else primary_svc_port
+        for h in ing_values.get("hosts", []):
+            for p in h.get("paths", []):
+                if not p.get("servicePort"): p["servicePort"] = default_svc_port
+
+    # 7. Env & Assembly
+    env_list = app.env.copy()
+    for key in app.env_vars:
+        if key in secret_pool:
+            env_list.append({"name": key, "valueFrom": {"secretKeyRef": {"name": f"{project_name}-secret", "key": key}}})
+    env_from = [{"configMapRef": {"name": f"{project_name}-config"}}] + app.envFrom
+
+    # 8. Assembly
+    deploy_ports = []
+    for p in all_ports:
+        dp = {"name": p.name, "containerPort": p.targetPort or p.port, "protocol": p.protocol}
+        deploy_ports.append(dp)
+
+    return {
+        "type": app.type,
+        "image": {"repository": image_name, "tag": tag, "pullPolicy": app.pullPolicy},
+        "deployment": {
+            "replicas": app.replicas,
+            "containerPort": primary_container_port,
+            "ports": deploy_ports,
+            "resources": app.resources, "strategy": {"type": app.strategy},
+            "securityContext": sec_ctx, "envFrom": env_from, "env": env_list,
+            "volumes": volumes, "volumeMounts": volume_mounts, "affinity": app.affinity,
+            "livenessProbe": liveness, "readinessProbe": readiness, "startupProbe": startup,
+            "imagePullSecrets": app.imagePullSecrets or project.imagePullSecrets or [{"name": DEFAULT_PULL_SECRET}],
+            "podAnnotations": app.podAnnotations
         },
-        "data": config_pool
+        "serviceAccount": {
+            "create": app.serviceAccount.create,
+            "name": app.serviceAccount.name or app.serviceAccountName,
+            "automountServiceAccountToken": app.serviceAccount.automountToken
+        },
+        "service": svc_values, "ingress": ing_values,
+        "pvc": app.pvc.model_dump(exclude_none=True), "localConfig": {"enabled": app.genConfigMaps}
     }
-    write_yaml(chart_dir / "templates" / "configmap.yaml", cm_data, dry_run)
-
-
-def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False, image_tag: str = None) -> None:
-    """Generates or updates the Helm chart directory for a single app."""
-    app_name: str = app["name"]
-    chart_dir = CHARTS_DIR / app_name
-    common_version = global_defaults.get("common_version", "1.0.0")
-
-    print(f"\n▶  Processing app: {app_name} (type={app.get('type', 'deployment')})")
-
-    # 1. Create chart directory
-    ensure_dir(chart_dir, dry_run)
-
-    # 2. Create templates/ with the single router-call file (all.yaml)
-    ensure_dir(chart_dir / "templates", dry_run)
-
-    # Write all.yaml — always overwrite since it's fully auto-generated
-    all_yaml_path = chart_dir / "templates" / "all.yaml"
-    if dry_run:
-        print(f"  [DRY-RUN] Would write: {all_yaml_path}")
-    else:
-        all_yaml_path.write_text(ALL_YAML_CONTENT)
-        print(f"  [WRITE]   {all_yaml_path}")
-
-    # 3. Generate Chart.yaml (always overwrite — version is managed by this script)
-    chart_yaml_path = chart_dir / "Chart.yaml"
-    write_yaml(chart_yaml_path, build_chart_yaml(app_name, common_version), dry_run)
-
-    # 4. Generate values.yaml (always overwrite — source of truth is apps_definition.yaml)
-    values_yaml_path = chart_dir / "values.yaml"
-    write_yaml(values_yaml_path, build_values_yaml(app, global_defaults, project_vars, image_tag), dry_run)
-
-    # 5. Create images.yaml ONLY if it doesn't exist — CI owns this file after first creation
-    images_yaml_path = chart_dir / "images.yaml"
-    if not images_yaml_path.exists():
-        write_yaml(images_yaml_path, build_images_yaml(), dry_run)
-    else:
-        print(f"  [SKIP]    {images_yaml_path} (already exists — owned by CI)")
-
-
-def main(definition_path: Path, output_dir: Path, dry_run: bool, image_tag: str = None) -> None:
-    """Entry point: loads app definitions and runs the generator for each app."""
-    global CHARTS_DIR, COMMON_LIB_REL
-
-    if not definition_path.exists():
-        print(f"ERROR: Definition file not found: {definition_path}", file=sys.stderr)
-        sys.exit(1)
-
-    CHARTS_DIR = output_dir.resolve()
-    
-    try:
-        import os
-        dummy_app_path = CHARTS_DIR / "dummy-app"
-        COMMON_LIB_REL = os.path.relpath(COMMON_LIB_PATH, dummy_app_path)
-    except Exception as e:
-        print(f"WARNING: Could not calculate relative path to common-lib: {e}")
-
-    with definition_path.open() as f:
-        data = yaml.safe_load(f)
-
-    global_defaults = {
-        "project": data.get("project", "unknown"),
-        "common_version": data.get("common_version", "1.0.0"),
-        "namespace": data.get("namespace", "default"),
-        "image_repo": data.get("image_repo"),
-        "image_tag": data.get("image_tag"),
-        "imagePullSecrets": data.get("imagePullSecrets"),
-    }
-    apps = data.get("apps", [])
-
-    # Load and parse variables.env if it exists in the same directory as definition
-    env_path = definition_path.parent / "variables.env"
-    project_vars = parse_env_file(env_path)
-    
-    print(f"=== Helm Monorepo Generator ===")
-    print(f"Project         : {global_defaults['project']}")
-    print(f"Environment Info: {env_path.name if env_path.exists() else 'None'}")
-    print(f"Config keys     : {len(project_vars[0])}")
-    print(f"Secret keys     : {len(project_vars[1])}")
-    print(f"Apps to process : {len(apps)}")
-    print(f"Dry-run mode    : {dry_run}")
-    print(f"Image Tag       : {image_tag or 'Default'}")
-    print(f"Output dir      : {CHARTS_DIR}")
-
-    if not apps:
-        print("\nWARNING: No apps found in definition file. Nothing to generate.")
-        return
-
-    # 1. Generate shared resources chart if we have project variables
-    if project_vars[0] or project_vars[1]:
-        generate_shared_chart(global_defaults, project_vars, dry_run)
-
-    # 2. Generate each application chart
-    for app in apps:
-        if "name" not in app:
-            print(f"\nERROR: Skipping invalid app entry (missing 'name'): {app}", file=sys.stderr)
-            continue
-        generate_chart(app, global_defaults, project_vars, dry_run, image_tag)
-
-    print(f"\n✅  Done. Generated resources in {CHARTS_DIR}/")
-
 
 # ---------------------------------------------------------------------------
-# CLI
+# Core
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Helm Monorepo Generator — scaffolds Helm charts from an apps definition YAML.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  # Root-level project (default):
-  python3 scripts/generator.py
+ALL_YAML_CONTENT = """{{/* Auto-generated by generator.py */}}\n{{ include "common-lib.main" . }}\n"""
 
-  # One of several sub-projects:
-  python3 scripts/generator.py --project ecommerce
-
-  # Dry-run to preview changes without writing files:
-  python3 scripts/generator.py --project fintech --dry-run
-""",
-    )
-    parser.add_argument(
-        "--project",
-        metavar="NAME",
-        default=None,
-        help=(
-            "Sub-project name under the projects/ directory. "
-            "Auto-sets --definition to projects/NAME/apps.<env>.yaml "
-            "and --output-dir to projects/NAME/charts/. "
-            "Omit to use root-level definition (single-project mode)."
-        ),
-    )
-    parser.add_argument(
-        "--env",
-        metavar="ENV",
-        default="dev",
-        help="Environment name (e.g., dev, staging, prod). Defaults to 'dev'.",
-    )
-    parser.add_argument(
-        "--definition",
-        type=Path,
-        default=None,
-        help="Override path to the apps definition YAML file.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Override output directory for generated charts.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be done without writing any files.",
-    )
-    parser.add_argument(
-        "--image-tag",
-        metavar="TAG",
-        help="Image tag to inject into the values.yaml (e.g. CI_PIPELINE_ID).",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="GitOps Engine Generator")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--env", default="dev")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--image-tag")
     args = parser.parse_args()
 
-    # Resolve paths based on --project shortcut or explicit overrides
-    definition_filename = f"apps.{args.env}.yaml"
-    
-    if args.project:
-        project_root = REPO_ROOT / "projects" / args.project
-        resolved_definition = args.definition or (project_root / definition_filename)
-        resolved_output = args.output_dir or (project_root / "charts")
-    else:
-        resolved_definition = args.definition or (REPO_ROOT / definition_filename)
-        resolved_output = args.output_dir or (REPO_ROOT / "charts")
+    # Paths
+    project_dir = REPO_ROOT / "projects" / args.env / args.project
+    definition_path = project_dir / f"apps.{args.env}.yaml"
+    env_path = project_dir / f"apps.{args.env}.env"
+    output_dir = project_dir / "charts"
 
-    main(resolved_definition, resolved_output, args.dry_run, args.image_tag)
+    if not definition_path.exists():
+        print(f"ERROR: Definition not found at {definition_path}"); sys.exit(1)
+
+    with definition_path.open() as f: data = yaml.safe_load(f)
+    try: project_def = ProjectDefinition(**data)
+    except Exception as e:
+        print(f"ERROR: Validation failed for {definition_path}:\n{e}"); sys.exit(1)
+
+    project_vars = parse_env_file(env_path)
+    CHARTS_DIR = output_dir.resolve()
+    print(f"=== GitOps Engine Generator (RBAC Hardened) ===\nProject: {project_def.project} | Env: {args.env}")
+    
+    # Generate Shared Chart
+    if project_vars[0] or project_vars[1]:
+        shared_dir = CHARTS_DIR / "project-shared"
+        ensure_dir(shared_dir, args.dry_run)
+        ensure_dir(shared_dir / "templates", args.dry_run)
+        if not args.dry_run:
+            desc = {"apiVersion": "v2", "name": f"{project_def.project}-shared", "description": "Shared resources", "type": "application", "version": "0.1.0", "dependencies": [{"name": "common-lib", "version": project_def.common_version, "repository": f"file://{COMMON_LIB_REL_PATH}", "alias": "common-lib"}]}
+            write_yaml(shared_dir / "Chart.yaml", desc, False)
+            cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": f"{project_def.project}-config"}, "data": project_vars[0]}
+            write_yaml(shared_dir / "templates" / "configmap.yaml", cm, False)
+
+    # Generate App Charts
+    for app in project_def.apps:
+        chart_dir = CHARTS_DIR / app.name
+        ensure_dir(chart_dir, args.dry_run)
+        ensure_dir(chart_dir / "templates", args.dry_run)
+        if not args.dry_run:
+            (chart_dir / "templates" / "all.yaml").write_text(ALL_YAML_CONTENT)
+            desc = {"apiVersion": "v2", "name": app.name, "description": f"Chart for {app.name}", "type": "application", "version": "0.1.0", "dependencies": [{"name": "common-lib", "version": project_def.common_version, "repository": f"file://{COMMON_LIB_REL_PATH}", "alias": "common-lib"}]}
+            write_yaml(chart_dir / "Chart.yaml", desc, False)
+            write_yaml(chart_dir / "values.yaml", build_values_yaml(app, project_def, project_vars, args.image_tag), False)
+
+    print(f"\n✅ Manifests generated in {output_dir}")
+
+if __name__ == "__main__":
+    main()

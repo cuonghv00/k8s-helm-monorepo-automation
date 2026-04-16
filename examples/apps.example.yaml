@@ -1,0 +1,96 @@
+# examples/apps.example.yaml
+# ==============================================================================
+# Comprehensive Application Definition Example
+# Use this as a template for your project configuration.
+# ==============================================================================
+
+project: "example-project"        # Project name (used for labels and namespaces)
+common_version: "1.0.0"           # Version of 'common-lib' to use
+image_repo: "registry.vn/example" # Default registry for all apps in this project
+image_tag: "v1.0.0"               # Default image tag if not specified in app
+
+# Global Pull Secrets for the whole project
+imagePullSecrets:
+  - name: "regcred-global"
+
+apps:
+  # ----------------------------------------------------------------------------
+  # CASE 1: Simple Web Service
+  # ----------------------------------------------------------------------------
+  - name: "web-portal"
+    port: 80                      # Container port
+    replicas: 2
+    ingress:
+      enabled: true
+      host: "portal.example.com"  # Simplified single host setup
+    health:
+      enabled: true               # Default liveness/readiness on '/' (HTTP)
+
+  # ----------------------------------------------------------------------------
+  # CASE 2: API Service with custom logic
+  # ----------------------------------------------------------------------------
+  - name: "backend-api"
+    type: "deployment"            # Default type
+    port: 3000
+    service:
+      enabled: true
+      port: 80                    # External service port mapping to 3000
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+    # Environment variables
+    env_vars:
+      - DATABASE_URL              # Fetched from apps.env.env (ConfigMap)
+      - API_KEY                   # Fetched from HashiCorp Vault (Secret)
+    env:
+      - name: LOG_LEVEL
+        value: "debug"
+
+  # ----------------------------------------------------------------------------
+  # CASE 3: Stateful Service (Redis/Database Proxy)
+  # ----------------------------------------------------------------------------
+  - name: "redis-cache"
+    port: 6379
+    health:
+      enabled: true
+      # No 'path' defined + port 6379 -> Generator auto-sets tcpSocket check
+    pvc:
+      enabled: true
+      size: "20Gi"
+      storageClass: "fast-storage"
+      mountPath: "/data"
+    securityContext:
+      runAsUser: 999              # Override default security settings
+      readOnlyRootFilesystem: false # Disable R/O for legacy apps
+
+  # ----------------------------------------------------------------------------
+  # CASE 4: Advanced Networking (Multiple Ingress Paths)
+  # ----------------------------------------------------------------------------
+  - name: "admin-panel"
+    ingress:
+      enabled: true
+      hosts:
+        - host: "admin.example.com"
+          paths:
+            - path: "/internal"
+              pathType: "Prefix"
+            - path: "/static"
+              pathType: "ImplementationSpecific"
+      annotations:
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+  # ----------------------------------------------------------------------------
+  # CASE 5: Custom Health Checks (gRPC or Specific Paths)
+  # ----------------------------------------------------------------------------
+  - name: "auth-service"
+    health:
+      enabled: true
+      liveness: "/live"           # Short-form HTTP path
+      readiness:
+        path: "/ready"            # Long-form with parameters
+        initialDelaySeconds: 30
+        failureThreshold: 5

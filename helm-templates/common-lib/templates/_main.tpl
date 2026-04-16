@@ -13,6 +13,11 @@
 ---
 {{- end }}
 
+{{- if .Values.serviceAccount.create }}
+{{ include "common-lib.serviceAccount" . }}
+---
+{{- end }}
+
 {{- if eq .Values.type "deployment" }}
 {{ include "common-lib.deployment" . }}
 {{- else }}

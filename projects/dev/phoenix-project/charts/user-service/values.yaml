@@ -1,0 +1,71 @@
+type: deployment
+image:
+  repository: registry.vn/phoenix-project/user-service
+  tag: v1.2.3
+  pullPolicy: IfNotPresent
+deployment:
+  replicas: 1
+  containerPort: 3000
+  ports:
+  - name: http
+    containerPort: 3000
+    protocol: TCP
+  resources: {}
+  strategy:
+    type: RollingUpdate
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    capabilities:
+      drop:
+      - ALL
+  envFrom:
+  - configMapRef:
+      name: phoenix-project-config
+  env:
+  - name: LOG_LEVEL
+    value: debug
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: phoenix-project-secret
+        key: DB_PASSWORD
+  volumes:
+  - name: tmp
+    emptyDir: {}
+  volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  affinity: {}
+  livenessProbe: null
+  readinessProbe: null
+  startupProbe: null
+  imagePullSecrets:
+  - name: regcred
+  podAnnotations: {}
+serviceAccount:
+  create: true
+  name: null
+  automountServiceAccountToken: false
+service:
+  enabled: true
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP
+    nodePort: null
+  annotations: {}
+ingress:
+  enabled: false
+pvc:
+  enabled: false
+  size: 10Gi
+  accessModes:
+  - ReadWriteOnce
+localConfig:
+  enabled: false
