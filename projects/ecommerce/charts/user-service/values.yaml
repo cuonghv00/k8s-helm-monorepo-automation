@@ -1,7 +1,7 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/user-service
-  tag: null
+  tag: latest
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
@@ -62,5 +62,6 @@ serviceAccount:
   name: default
 service: {}
 ingress: {}
+pvc: {}
 localConfig:
   enabled: false

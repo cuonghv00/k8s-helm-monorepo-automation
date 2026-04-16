@@ -1,0 +1,57 @@
+# .github/workflows/deploy.yml.example
+# ==============================================================================
+# GitHub Actions Workflow Example for Helm Monorepo Optimization
+# ==============================================================================
+
+name: Deploy Orchestration
+
+on:
+  push:
+    branches: [ main ]
+    # Prevent infinite loop by ignoring bot commits
+    paths-ignore:
+      - 'projects/*/charts/**'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          # Fetch all history so we can push back
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install pyyaml
+          sudo apt-get install jq -y
+
+      # 1. Build & Push (Mock)
+      - name: Docker Build & Push
+        run: |
+          echo "Building image with tag: ${{ github.run_id }}"
+          # docker build ...
+
+      # 2. Sync Secrets (Optional if using ESO/AVP)
+      - name: Sync Secrets from Vault
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          chmod +x scripts/vault_sync.sh
+          ./scripts/vault_sync.sh ecommerce ecommerce dev ecommerce
+
+      # 3. Generate & Push Back
+      - name: Run Orchestrator
+        run: |
+          chmod +x scripts/deploy.sh
+          # The script uses [skip ci] in commit message to prevent loops in GitLab/others
+          # GitHub Actions uses 'paths-ignore' but [skip ci] is also good practice.
+          ./scripts/deploy.sh --project ecommerce --env dev --image-tag ${{ github.run_id }}

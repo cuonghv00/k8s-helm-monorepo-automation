@@ -1,7 +1,7 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/payment-service
-  tag: null
+  tag: latest
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
@@ -40,5 +40,6 @@ service:
   targetPort: 9090
   nodePort: 30005
 ingress: {}
+pvc: {}
 localConfig:
   enabled: false

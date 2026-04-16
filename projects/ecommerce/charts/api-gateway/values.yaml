@@ -1,7 +1,7 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/api-gateway
-  tag: null
+  tag: latest
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
@@ -64,5 +64,6 @@ ingress:
     - path: /
       pathType: ImplementationSpecific
       servicePort: 80
+pvc: {}
 localConfig:
   enabled: false

@@ -8,6 +8,11 @@
   {{- fail "ERROR: .Values.type is required. Supported values: deployment" }}
 {{- end }}
 
+{{- if and .Values.pvc .Values.pvc.enabled }}
+{{ include "common-lib.pvc" . }}
+---
+{{- end }}
+
 {{- if eq .Values.type "deployment" }}
 {{ include "common-lib.deployment" . }}
 {{- else }}

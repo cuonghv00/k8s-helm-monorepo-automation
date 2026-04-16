@@ -1,0 +1,25 @@
+{{/*
+  _pvc.yaml
+  Standard PVC template for stateful applications.
+*/}}
+{{- define "common-lib.pvc" -}}
+{{- if .Values.pvc -}}
+{{- if and .Values.pvc.enabled (not .Values.pvc.existingClaim) -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "common-lib.fullname" . }}
+  labels:
+    {{- include "common-lib.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.pvc.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.pvc.size | quote }}
+  {{- if .Values.pvc.storageClass }}
+  storageClassName: {{ .Values.pvc.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

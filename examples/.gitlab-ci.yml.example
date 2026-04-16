@@ -1,0 +1,66 @@
+# examples/.gitlab-ci.yml.example
+# ==============================================================================
+# GitLab CI Pipeline Example for Helm Monorepo Optimization
+# ==============================================================================
+
+stages:
+  - build
+  - sync-secrets
+  - deploy-orchestration
+
+variables:
+  # Standard GitLab CI variables
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE/$CI_PROJECT_NAME
+  IMAGE_TAG: $CI_PIPELINE_ID
+  # Vault configurations
+  VAULT_ADDR: "https://vault.example.com"
+  VAULT_AUTH_ROLE: "gitlab-ci-role"
+
+.base-job:
+  image: python:3.9-slim
+  before_script:
+    - apt-get update && apt-get install -y git jq curl
+    - pip install pyyaml
+    # Set up Git for pushback
+    - git config --global user.name "GitLab CI Bot"
+    - git config --global user.email "ci-bot@example.com"
+    # Use CI_JOB_TOKEN to allow push back to the repo
+    - git remote set-url origin "https://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+
+# 1. Build and Push (Simplified)
+build-image:
+  stage: build
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  script:
+    - docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} .
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+  only:
+    - main
+
+# 2. Sync Secrets from Vault
+sync-secrets:
+  stage: sync-secrets
+  extends: .base-job
+  script:
+    - chmod +x scripts/vault_sync.sh
+    # ./vault_sync.sh <team> <project> <env> <namespace>
+    - ./scripts/vault_sync.sh ecommerce ecommerce dev ecommerce
+  only:
+    - main
+
+# 3. Generate Charts and Push Back to Git
+orchestrate-deploy:
+  stage: deploy-orchestration
+  extends: .base-job
+  script:
+    - chmod +x scripts/deploy.sh
+    # This script will: 
+    #   1. Gen charts with --image-tag $IMAGE_TAG
+    #   2. Git commit & push back to this repo
+    #   3. ArgoCD will then pick up the changes
+    - ./scripts/deploy.sh --project ecommerce --env dev --image-tag ${IMAGE_TAG}
+  only:
+    - main

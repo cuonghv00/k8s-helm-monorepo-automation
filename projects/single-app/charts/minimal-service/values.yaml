@@ -1,7 +1,7 @@
 type: deployment
 image:
   repository: registry.vn/test/minimal-service
-  tag: null
+  tag: PIPELINE-123
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1

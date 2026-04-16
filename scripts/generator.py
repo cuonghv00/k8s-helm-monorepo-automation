@@ -110,39 +110,34 @@ def build_chart_yaml(app_name: str, common_version: str, is_shared: bool = False
     }
 
 
-def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict, list]) -> dict:
+def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict, list], image_tag: str = None) -> dict:
     """
-    Maps the flat app config from apps_definition.yaml to the nested
-    values structure expected by common-lib templates.
+    Constructs the values.yaml content for a specific app based on defaults and overrides.
     """
     config_pool, secret_pool = project_vars
     project_name = global_defaults.get("project", "default")
     
-    # 1. Merge nested 'config' and first item from 'containers' for flexibility
+    # 1. Merge nested 'config' and handle K8s-style 'containers' for flexibility
     cfg = app.get("config", {})
     
-    # Handle 'containers' list if it exists (K8s style)
     container_cfg = {}
     if "containers" in app:
         containers = app["containers"]
         if isinstance(containers, list) and len(containers) > 0:
             container_cfg = containers[0]
-        elif isinstance(containers, dict): # Handle if operator forgot to use a list
+        elif isinstance(containers, dict):
             container_cfg = containers
 
     full_app = {**app, **cfg, **container_cfg}
-    
     app_name = full_app.get("name")
     
     # 2. Image construction
     image_repo = full_app.get("image_repo") or global_defaults.get("image_repo", "registry.example.com")
     image_override = full_app.get("image")
-    tag = full_app.get("image_tag") or global_defaults.get("image_tag", "latest")
     
-    # Ignore placeholder strings
-    if image_override and "điền tên" in image_override:
-        image_override = None
-
+    # Priority for Tag: 1. CLI Arg (image_tag), 2. App definition, 3. Global default, 4. 'latest'
+    tag = image_tag or full_app.get("image_tag") or global_defaults.get("image_tag") or "latest"
+    
     if image_override:
         image_name = image_override
     else:
@@ -243,10 +238,35 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
     env_list = full_app.get("env", [])
     env_keys = full_app.get("env_vars", []) # New simplified key
     
-    # 6. Service Configuration (Smart Defaults)
+    # 6. Service & Storage (PVC) Configuration
     svc_cfg = full_app.get("service", {})
     ingress_cfg = full_app.get("ingress", {})
+    pvc_cfg = full_app.get("pvc", {})
     app_port = full_app.get("port", 80)
+
+    # 6a. Storage (PVC) logic
+    if pvc_cfg.get("enabled"):
+        # Auto-configure volumes/mounts if mountPath is provided
+        mount_path = pvc_cfg.get("mountPath")
+        if mount_path:
+            # Add to volumes
+            volumes.append({
+                "name": "data-volume",
+                "persistentVolumeClaim": {
+                    "claimName": "{{ include \"common-lib.fullname\" . }}"
+                }
+            })
+            # Add to volumeMounts
+            volume_mounts.append({
+                "name": "data-volume",
+                "mountPath": mount_path
+            })
+        
+        # Ensure default PVC settings
+        if "accessModes" not in pvc_cfg:
+            pvc_cfg["accessModes"] = ["ReadWriteOnce"]
+        if "size" not in pvc_cfg:
+            pvc_cfg["size"] = "10Gi"
     
     # Auto-enable service if ingress is present or service block is present
     if (ingress_cfg.get("enabled") or svc_cfg) and not svc_cfg:
@@ -359,6 +379,7 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
         },
         "service": svc_cfg,
         "ingress": full_app.get("ingress", {}),
+        "pvc": pvc_cfg,
         "localConfig": {
             "enabled": full_app.get("genConfigMaps", False)
         }
@@ -445,22 +466,9 @@ def generate_shared_chart(global_defaults: dict, project_vars: tuple[dict, list]
         "data": config_pool
     }
     write_yaml(chart_dir / "templates" / "configmap.yaml", cm_data, dry_run)
-    
-    # 3. Secret template (Contains placeholders, will be updated by vault_sync.sh)
-    # We create a dummy secret with the keys but empty values or placeholders
-    secret_data = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": f"{project_name}-secret",
-        },
-        "type": "Opaque",
-        "data": {key: "" for key in secret_pool}
-    }
-    write_yaml(chart_dir / "templates" / "secret.yaml", secret_data, dry_run)
 
 
-def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False) -> None:
+def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False, image_tag: str = None) -> None:
     """Generates or updates the Helm chart directory for a single app."""
     app_name: str = app["name"]
     chart_dir = CHARTS_DIR / app_name
@@ -488,7 +496,7 @@ def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, l
 
     # 4. Generate values.yaml (always overwrite — source of truth is apps_definition.yaml)
     values_yaml_path = chart_dir / "values.yaml"
-    write_yaml(values_yaml_path, build_values_yaml(app, global_defaults, project_vars), dry_run)
+    write_yaml(values_yaml_path, build_values_yaml(app, global_defaults, project_vars, image_tag), dry_run)
 
     # 5. Create images.yaml ONLY if it doesn't exist — CI owns this file after first creation
     images_yaml_path = chart_dir / "images.yaml"
@@ -498,7 +506,7 @@ def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, l
         print(f"  [SKIP]    {images_yaml_path} (already exists — owned by CI)")
 
 
-def main(definition_path: Path, output_dir: Path, dry_run: bool) -> None:
+def main(definition_path: Path, output_dir: Path, dry_run: bool, image_tag: str = None) -> None:
     """Entry point: loads app definitions and runs the generator for each app."""
     global CHARTS_DIR, COMMON_LIB_REL
 
@@ -539,6 +547,7 @@ def main(definition_path: Path, output_dir: Path, dry_run: bool) -> None:
     print(f"Secret keys     : {len(project_vars[1])}")
     print(f"Apps to process : {len(apps)}")
     print(f"Dry-run mode    : {dry_run}")
+    print(f"Image Tag       : {image_tag or 'Default'}")
     print(f"Output dir      : {CHARTS_DIR}")
 
     if not apps:
@@ -554,7 +563,7 @@ def main(definition_path: Path, output_dir: Path, dry_run: bool) -> None:
         if "name" not in app:
             print(f"\nERROR: Skipping invalid app entry (missing 'name'): {app}", file=sys.stderr)
             continue
-        generate_chart(app, global_defaults, project_vars, dry_run)
+        generate_chart(app, global_defaults, project_vars, dry_run, image_tag)
 
     print(f"\n✅  Done. Generated resources in {CHARTS_DIR}/")
 
@@ -613,6 +622,11 @@ examples:
         action="store_true",
         help="Print what would be done without writing any files.",
     )
+    parser.add_argument(
+        "--image-tag",
+        metavar="TAG",
+        help="Image tag to inject into the values.yaml (e.g. CI_PIPELINE_ID).",
+    )
     args = parser.parse_args()
 
     # Resolve paths based on --project shortcut or explicit overrides
@@ -626,4 +640,4 @@ examples:
         resolved_definition = args.definition or (REPO_ROOT / definition_filename)
         resolved_output = args.output_dir or (REPO_ROOT / "charts")
 
-    main(resolved_definition, resolved_output, args.dry_run)
+    main(resolved_definition, resolved_output, args.dry_run, args.image_tag)

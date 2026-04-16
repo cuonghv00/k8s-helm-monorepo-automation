@@ -47,3 +47,7 @@ apps:
     port: 6379
     health:
       enabled: true      # No path defined -> should use tcpSocket
+    pvc:
+      enabled: true
+      size: "5Gi"
+      mountPath: "/data"

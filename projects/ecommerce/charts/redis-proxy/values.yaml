@@ -1,7 +1,7 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/redis-proxy
-  tag: null
+  tag: latest
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
@@ -27,9 +27,14 @@ deployment:
   volumes:
   - name: tmp
     emptyDir: {}
+  - name: data-volume
+    persistentVolumeClaim:
+      claimName: '{{ include "common-lib.fullname" . }}'
   volumeMounts:
   - name: tmp
     mountPath: /tmp
+  - name: data-volume
+    mountPath: /data
   affinity: {}
   livenessProbe:
     initialDelaySeconds: 10
@@ -50,5 +55,11 @@ serviceAccount:
   name: default
 service: {}
 ingress: {}
+pvc:
+  enabled: true
+  size: 5Gi
+  mountPath: /data
+  accessModes:
+  - ReadWriteOnce
 localConfig:
   enabled: false
