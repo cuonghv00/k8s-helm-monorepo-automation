@@ -1,11 +1,11 @@
 type: deployment
 image:
-  repository: registry.vn/test/minimal-service
-  tag: PIPELINE-123
+  repository: registry.vn/ecommerce/minimal-service
+  tag: PIPELINE-TEST-888
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
-  containerPort: 80
+  containerPort: 8080
   resources: {}
   strategy:
     type: RollingUpdate
@@ -22,7 +22,7 @@ deployment:
   - name: regcred
   envFrom:
   - configMapRef:
-      name: single-app-test-config
+      name: ecommerce-config
   env: []
   volumes:
   - name: tmp
@@ -36,5 +36,6 @@ serviceAccount:
   name: default
 service: {}
 ingress: {}
+pvc: {}
 localConfig:
   enabled: false

@@ -1,11 +1,11 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/user-service
-  tag: latest
+  tag: PIPELINE-TEST-888
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
-  containerPort: 8080
+  containerPort: 3000
   resources: {}
   strategy:
     type: RollingUpdate
@@ -24,16 +24,13 @@ deployment:
   - configMapRef:
       name: ecommerce-config
   env:
+  - name: LOG_LEVEL
+    value: debug
   - name: DB_PASSWORD
     valueFrom:
       secretKeyRef:
         name: ecommerce-secret
         key: DB_PASSWORD
-  - name: JWT_SECRET
-    valueFrom:
-      secretKeyRef:
-        name: ecommerce-secret
-        key: JWT_SECRET
   volumes:
   - name: tmp
     emptyDir: {}
@@ -41,26 +38,13 @@ deployment:
   - name: tmp
     mountPath: /tmp
   affinity: {}
-  livenessProbe:
-    initialDelaySeconds: 30
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /liveness
-      port: 8080
-  readinessProbe:
-    initialDelaySeconds: 10
-    periodSeconds: 2
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /health
-      port: 8080
 serviceAccount:
   create: false
   name: default
-service: {}
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
 ingress: {}
 pvc: {}
 localConfig:

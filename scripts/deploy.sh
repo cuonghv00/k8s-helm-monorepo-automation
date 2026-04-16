@@ -79,28 +79,33 @@ git config user.name "${GIT_USER}"
 git config user.email "${GIT_EMAIL}"
 
 git add "$TARGET_DIR"
-# [skip ci] prevents the CI from entering an infinite loop when this script pushes back
-git commit -m "chore(ops): update generated charts for ${PROJECT} (${ENV}) [skip ci]"
+# Check if there are actual changes before committing
+if git diff-index --quiet HEAD --; then
+    echo "ℹ No changes detected in charts. Skipping commit."
+    SUCCESS=true
+else
+    # [skip ci] prevents the CI from entering an infinite loop when this script pushes back
+    git commit -m "chore(ops): update generated charts for ${PROJECT} (${ENV}) [skip ci]"
 
-echo "▶ Pushing changes to origin (with retry logic)..."
-MAX_RETRIES=5
-RETRY_COUNT=0
-SUCCESS=false
+    echo "▶ Pushing changes to origin (with retry logic)..."
+    MAX_RETRIES=5
+    RETRY_COUNT=0
+    SUCCESS=false
 
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    # Pull latest changes and rebase our commit on top to avoid conflicts
-    # Since each app lives in its own directory, rebase conflicts are unlikely.
-    if git pull --rebase origin HEAD; then
-        if git push origin HEAD; then
-            SUCCESS=true
-            break
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        # Pull latest changes and rebase our commit on top to avoid conflicts
+        if git pull --rebase origin HEAD; then
+            if git push origin HEAD; then
+                SUCCESS=true
+                break
+            fi
         fi
-    fi
-    
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "⚠️  Push failed (likely concurrent update). Retrying in 5s... ($RETRY_COUNT/$MAX_RETRIES)"
-    sleep 5
-done
+        
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        echo "⚠️  Push failed (likely concurrent update). Retrying in 5s... ($RETRY_COUNT/$MAX_RETRIES)"
+        sleep 5
+    done
+fi
 
 if [ "$SUCCESS" = true ]; then
     echo "✅ Deployment manifests successfully updated in Git."

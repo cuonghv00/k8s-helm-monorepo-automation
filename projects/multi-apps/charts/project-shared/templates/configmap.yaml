@@ -1,8 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: multi-apps-test-config
-data:
-  DB_HOST: postgres.prod.svc.cluster.local
-  LOG_LEVEL: info
-  DOMAIN: example.com

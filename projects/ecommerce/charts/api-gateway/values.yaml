@@ -1,12 +1,18 @@
 type: deployment
 image:
   repository: registry.vn/ecommerce/api-gateway
-  tag: latest
+  tag: PIPELINE-TEST-888
   pullPolicy: IfNotPresent
 deployment:
-  replicas: 1
+  replicas: 2
   containerPort: 80
-  resources: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
   strategy:
     type: RollingUpdate
   securityContext:
@@ -23,8 +29,6 @@ deployment:
   envFrom:
   - configMapRef:
       name: ecommerce-config
-  - configMapRef:
-      name: external-global-config
   env: []
   volumes:
   - name: tmp
@@ -38,16 +42,14 @@ deployment:
     periodSeconds: 5
     timeoutSeconds: 2
     failureThreshold: 3
-    httpGet:
-      path: /
+    tcpSocket:
       port: 80
   readinessProbe:
     initialDelaySeconds: 10
     periodSeconds: 5
     timeoutSeconds: 2
     failureThreshold: 3
-    httpGet:
-      path: /
+    tcpSocket:
       port: 80
 serviceAccount:
   create: false
@@ -58,6 +60,7 @@ service:
   targetPort: 80
 ingress:
   enabled: true
+  path: /
   hosts:
   - host: api.example.com
     paths:

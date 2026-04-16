@@ -17,7 +17,7 @@ spec:
   generators:
     - git:
         # Update this to your platform repo URL
-        repoURL: https://github.com/cuonghv00/k8s-helm-monorepo-automation.git
+        repoURL: https://github.com/cuonghv00/gitops-engine.git
         revision: HEAD
         directories:
           - path: projects/*/charts/*
@@ -34,7 +34,7 @@ spec:
       # Grouping by ArgoCD Project
       project: '{{path.segments[1]}}'
       source:
-        repoURL: https://github.com/cuonghv00/k8s-helm-monorepo-automation.git
+        repoURL: https://github.com/cuonghv00/gitops-engine.git
         targetRevision: HEAD
         path: '{{path}}'
         helm:

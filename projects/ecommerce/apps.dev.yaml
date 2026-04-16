@@ -1,53 +1,76 @@
+# projects/ecommerce/apps.dev.yaml
+# ==============================================================================
+# Reference Project: E-commerce Platform
+# Use this file as a guide for configuring different types of applications.
+# ==============================================================================
+
 project: "ecommerce"
 common_version: "1.0.0"
-namespace: "ecommerce"
 image_repo: "registry.vn/ecommerce"
+image_tag: "latest"
+
+# 1. Global Project Variables (Injected via envFrom to all apps)
+# These are defined in variables.env in the same directory.
+# generator.py auto-creates a ConfigMap named 'ecommerce-config'.
 
 apps:
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 1: Minimal Service (Simple)
+  # Just name and port. Good for internal tools or auxiliary services.
+  # ----------------------------------------------------------------------------
+  - name: "minimal-service"
+    port: 8080
+
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 2: API Gateway (Intermediate)
+  # Demonstrates Ingress, basic Health Checks, and Resource Limits.
+  # ----------------------------------------------------------------------------
   - name: "api-gateway"
     port: 80
+    replicas: 2
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
     ingress:
       enabled: true
       host: "api.example.com"
+      path: "/"
     health:
-      enabled: true
-      path: "/"           # Explicitly HTTP
-    envFrom:
-      - configMapRef:
-          name: "external-global-config"
+      enabled: true      # Uses default HTTP check on '/'
 
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 3: User Service (Advanced)
+  # Demonstrates Env Variables, Secrets (from Vault), and Custom Port Mapping.
+  # ----------------------------------------------------------------------------
   - name: "user-service"
-    port: 8080
-    health:
-      enabled: true
-      path: "/health"      # Global path for both
-      liveness:
-        path: "/liveness"  # Override path
-        initialDelaySeconds: 30
-      readiness:
-        periodSeconds: 2    # Override timing
-    env_vars:
-      - DB_PASSWORD
-      - JWT_SECRET
-
-  - name: "order-service"
-    port: 8080
-    env_vars:
-      - DB_PASSWORD
-      - STRIPE_API_KEY
-
-  - name: "payment-service"
-    port: 9090
+    image_tag: "v1.2.3"  # Overrides global image_tag
+    port: 3000           # Container port
     service:
-      type: NodePort
-      port: 80
-      nodePort: 30005
+      port: 80           # Service port (80) maps to Container port (3000)
+    # env_vars: mapping these keys from Vault/SharedConfig
+    env_vars:
+      - DATABASE_URL     # From shared variables.env
+      - DB_PASSWORD      # From Vault (injected via vault_sync.sh)
+      - AUTH_SECRET      # From Vault
+    env:                 # Ad-hoc environment variables
+      - name: LOG_LEVEL
+        value: "debug"
 
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 4: Redis Proxy (Stateful/Storage)
+  # Demonstrates TCP Health Checks and Persistence (PVC).
+  # ----------------------------------------------------------------------------
   - name: "redis-proxy"
     port: 6379
     health:
-      enabled: true      # No path defined -> should use tcpSocket
+      enabled: true
+      # No 'path' provided -> generator.py auto-sets tcpSocket check
     pvc:
       enabled: true
-      size: "5Gi"
+      size: "10Gi"
+      storageClass: "standard"
       mountPath: "/data"
