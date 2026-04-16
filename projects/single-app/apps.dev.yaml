@@ -1,0 +1,7 @@
+project: "single-app-test"
+common_version: "1.0.0"
+namespace: "test-ns"
+image_repo: "registry.vn/test"
+
+apps:
+  - name: "minimal-service"

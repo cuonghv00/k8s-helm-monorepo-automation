@@ -48,16 +48,55 @@ COMMON_LIB_REL = "../../helm-templates/common-lib"
 # Template builders
 # ---------------------------------------------------------------------------
 
-def build_chart_yaml(app_name: str, common_version: str) -> dict:
+# ---------------------------------------------------------------------------
+# Template builders
+# ---------------------------------------------------------------------------
+
+def parse_env_file(env_path: Path) -> tuple[dict, list]:
     """
-    Builds the Chart.yaml content for a child application chart.
-    The chart depends on common-lib via a local file:// path so that
-    `helm dependency update` resolves it without a Chart Museum.
+    Parses a .env file and classifies variables:
+    - Literals (KEY=VALUE) -> ConfigMap
+    - Placeholders (KEY=${VAR}) -> Secret
     """
+    config_data = {}
+    secret_keys = []
+    
+    if not env_path.exists():
+        return config_data, secret_keys
+
+    import re
+    # Pattern to match KEY=VALUE
+    pattern = re.compile(r"^\s*([\w.-]+)\s*=\s*(.*)\s*$")
+    
+    with env_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            
+            match = pattern.match(line)
+            if match:
+                key, value = match.groups()
+                # Remove quotes if present
+                value = value.strip("'\"")
+                
+                if value.startswith("${") and value.endswith("}"):
+                    secret_keys.append(key)
+                else:
+                    config_data[key] = value
+                    
+    return config_data, secret_keys
+
+
+def build_chart_yaml(app_name: str, common_version: str, is_shared: bool = False) -> dict:
+    """
+    Builds the Chart.yaml content for a child application chart or shared chart.
+    """
+    desc = f"Shared resources for project {app_name}" if is_shared else f"Application chart for {app_name}"
     return {
         "apiVersion": "v2",
         "name": app_name,
-        "description": f"Application chart for {app_name} — managed by generator.py",
+        "description": f"{desc} — managed by generator.py",
         "type": "application",
         "version": "0.1.0",
         "dependencies": [
@@ -71,64 +110,169 @@ def build_chart_yaml(app_name: str, common_version: str) -> dict:
     }
 
 
-def build_values_yaml(app: dict) -> dict:
+def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict, list]) -> dict:
     """
     Maps the flat app config from apps_definition.yaml to the nested
     values structure expected by common-lib templates.
     """
+    config_pool, secret_pool = project_vars
+    project_name = global_defaults.get("project", "default")
+    
+    # 1. Merge nested 'config' and first item from 'containers' for flexibility
     cfg = app.get("config", {})
+    
+    # Handle 'containers' list if it exists (K8s style)
+    container_cfg = {}
+    if "containers" in app:
+        containers = app["containers"]
+        if isinstance(containers, list) and len(containers) > 0:
+            container_cfg = containers[0]
+        elif isinstance(containers, dict): # Handle if operator forgot to use a list
+            container_cfg = containers
 
-    # Base Security Context (Maximum Hardening)
-    sec_ctx = {
+    full_app = {**app, **cfg, **container_cfg}
+    
+    app_name = full_app.get("name")
+    
+    # 2. Image construction
+    image_repo = full_app.get("image_repo") or global_defaults.get("image_repo", "registry.example.com")
+    image_override = full_app.get("image")
+    tag = full_app.get("image_tag") or global_defaults.get("image_tag", "latest")
+    
+    # Ignore placeholder strings
+    if image_override and "điền tên" in image_override:
+        image_override = None
+
+    if image_override:
+        image_name = image_override
+    else:
+        image_name = f"{image_repo}/{app_name}"
+
+    # 3. Base Security Context (Maximum Hardening)
+    default_sec_ctx = {
         "readOnlyRootFilesystem": True,
         "allowPrivilegeEscalation": False,
         "runAsNonRoot": True,
         "runAsUser": 1000,
+        "runAsGroup": 1000,
         "capabilities": {"drop": ["ALL"]}
     }
     
     # Merge override logic
-    app_sec_ctx = cfg.get("security_context", {})
-    if app_sec_ctx:
-        sec_ctx.update(app_sec_ctx)
-        if "capabilities" in app_sec_ctx:
-            sec_ctx["capabilities"] = app_sec_ctx["capabilities"]
+    sec_ctx = {**default_sec_ctx, **full_app.get("securityContext", {})}
 
-    # Volumes and Temp Mount
-    volumes = cfg.get("volumes", [])
-    volume_mounts = cfg.get("volume_mounts", [])
+    # 4. Volumes and Temp Mount
+    volumes = full_app.get("volumes", [])
+    volume_mounts = full_app.get("volumeMounts", [])
     
     # Auto-mount /tmp by default to prevent application crash on R/O FS
-    if sec_ctx.get("readOnlyRootFilesystem") and cfg.get("auto_mount_tmp", True):
-        tmp_vol_name = f"{app['name']}-tmp"
+    if sec_ctx.get("readOnlyRootFilesystem") and full_app.get("auto_mount_tmp", True):
+        tmp_vol_name = "tmp"
         if not any(v.get("name") == tmp_vol_name for v in volumes):
             volumes.append({"name": tmp_vol_name, "emptyDir": {}})
             volume_mounts.append({"name": tmp_vol_name, "mountPath": "/tmp"})
 
+    # Check if app needs to mount the whole shared env file
+    if full_app.get("mount_env_file"):
+        cm_name = f"{project_name}-config"
+        volume_mounts.append({
+            "name": "env-file",
+            "mountPath": "/app/.env",
+            "subPath": ".env"
+        })
+        volumes.append({
+            "name": "env-file",
+            "configMap": {"name": cm_name}
+        })
+
+    # 5. Health Check Simplification
+    health_cfg = full_app.get("health", {})
+    liveness = full_app.get("livenessProbe") or health_cfg.get("livenessProbe")
+    readiness = full_app.get("readinessProbe") or health_cfg.get("readinessProbe")
+    
+    if health_cfg.get("enabled"):
+        probe_path = health_cfg.get("path", "/")
+        probe_port = health_cfg.get("port") or full_app.get("port", 80)
+        
+        # If standard probes are missing, build from simplified health_cfg
+        default_probe = {
+            "httpGet": {"path": probe_path, "port": probe_port},
+            "initialDelaySeconds": health_cfg.get("initialDelaySeconds", 10),
+            "periodSeconds": health_cfg.get("periodSeconds", 5),
+            "timeoutSeconds": health_cfg.get("timeoutSeconds", 2),
+            "failureThreshold": health_cfg.get("failureThreshold", 3)
+        }
+        if not liveness:
+            liveness = default_probe
+        if not readiness:
+            readiness = default_probe
+
+    # 6. Environment Variables Mapping (Shared Resources aware)
+    env_list = full_app.get("env", [])
+    env_keys = full_app.get("env_vars", []) # New simplified key
+    
+    # Auto-set containerPort from service port if not explicitly set
+    svc_cfg = full_app.get("service", {})
+    svc_port = svc_cfg.get("port", 80)
+    container_port = full_app.get("port") or svc_port
+
+    # If operator just provided a list of keys, map them to shared resources
+    for key in env_keys:
+        if key in secret_pool:
+            env_list.append({
+                "name": key,
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": f"{project_name}-secret",
+                        "key": key
+                    }
+                }
+            })
+        elif key in config_pool:
+            env_list.append({
+                "name": key,
+                "valueFrom": {
+                    "configMapKeyRef": {
+                        "name": f"{project_name}-config",
+                        "key": key
+                    }
+                }
+            })
+        else:
+            print(f"  [WARNING] Key '{key}' not found in variables.env for app {app_name}")
+
+    # 7. Image Pull Secrets
+    # Priority: app.imagePullSecrets > global_defaults.imagePullSecrets > default [{"name": "regcred"}]
+    image_pull_secrets = full_app.get("imagePullSecrets") or global_defaults.get("imagePullSecrets") or [{"name": "regcred"}]
+
     values: dict = {
-        "type": app["type"],
+        "type": full_app.get("type", "deployment"),
         "image": {
-            "repository": cfg.get("image_repo", "registry.example.com/app"),
-            "tag": cfg.get("tag", "latest"),
-            "pullPolicy": cfg.get("pull_policy", "IfNotPresent"),
+            "repository": image_name,
+            "tag": tag,
+            "pullPolicy": full_app.get("pullPolicy", "IfNotPresent"),
         },
         "deployment": {
-            "replicas": cfg.get("replicas", 1),
-            "containerPort": cfg.get("port", 80),
-            "resources": cfg.get("resources", {}),
-            "strategy": {"type": "RollingUpdate"},
+            "replicas": full_app.get("replicas", 1),
+            "containerPort": container_port,
+            "resources": full_app.get("resources", {}),
+            "strategy": {"type": full_app.get("strategy", "RollingUpdate")},
             "securityContext": sec_ctx,
-            "env": cfg.get("env", []),
+            "imagePullSecrets": image_pull_secrets,
+            "livenessProbe": liveness,
+            "readinessProbe": readiness,
+            "env": env_list,
             "volumes": volumes,
             "volumeMounts": volume_mounts,
-            "affinity": cfg.get("affinity", {})
+            "affinity": full_app.get("affinity", {})
         },
         "serviceAccount": {
             "create": False,
-            "name": "",
+            "name": full_app.get("serviceAccount", "default"),
         },
-        "service": cfg.get("service", {}),
-        "ingress": cfg.get("ingress", {})
+        "service": svc_cfg,
+        "ingress": full_app.get("ingress", {}),
+        "genConfigMaps": full_app.get("genConfigMaps", False)
     }
 
     return values
@@ -187,12 +331,53 @@ ALL_YAML_CONTENT = """\
 """
 
 
-def generate_chart(app: dict, common_version: str, dry_run: bool = False) -> None:
+def generate_shared_chart(global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False) -> None:
+    """Generates the project-shared chart containing shared ConfigMap and Secret template."""
+    project_name = global_defaults["project"]
+    common_version = global_defaults["common_version"]
+    config_pool, secret_pool = project_vars
+    
+    chart_dir = CHARTS_DIR / "project-shared"
+    
+    print(f"\n▶  Generating shared resources: project-shared")
+    ensure_dir(chart_dir, dry_run)
+    ensure_dir(chart_dir / "templates", dry_run)
+    
+    # 1. Chart.yaml
+    write_yaml(chart_dir / "Chart.yaml", build_chart_yaml(f"{project_name}-shared", common_version, is_shared=True), dry_run)
+    
+    # 2. ConfigMap template
+    cm_data = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": f"{project_name}-config",
+        },
+        "data": config_pool
+    }
+    write_yaml(chart_dir / "templates" / "configmap.yaml", cm_data, dry_run)
+    
+    # 3. Secret template (Contains placeholders, will be updated by vault_sync.sh)
+    # We create a dummy secret with the keys but empty values or placeholders
+    secret_data = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": f"{project_name}-secret",
+        },
+        "type": "Opaque",
+        "data": {key: "" for key in secret_pool}
+    }
+    write_yaml(chart_dir / "templates" / "secret.yaml", secret_data, dry_run)
+
+
+def generate_chart(app: dict, global_defaults: dict, project_vars: tuple[dict, list], dry_run: bool = False) -> None:
     """Generates or updates the Helm chart directory for a single app."""
     app_name: str = app["name"]
     chart_dir = CHARTS_DIR / app_name
+    common_version = global_defaults.get("common_version", "1.0.0")
 
-    print(f"\n▶  Processing app: {app_name} (type={app['type']})")
+    print(f"\n▶  Processing app: {app_name} (type={app.get('type', 'deployment')})")
 
     # 1. Create chart directory
     ensure_dir(chart_dir, dry_run)
@@ -214,7 +399,7 @@ def generate_chart(app: dict, common_version: str, dry_run: bool = False) -> Non
 
     # 4. Generate values.yaml (always overwrite — source of truth is apps_definition.yaml)
     values_yaml_path = chart_dir / "values.yaml"
-    write_yaml(values_yaml_path, build_values_yaml(app), dry_run)
+    write_yaml(values_yaml_path, build_values_yaml(app, global_defaults, project_vars), dry_run)
 
     # 5. Create images.yaml ONLY if it doesn't exist — CI owns this file after first creation
     images_yaml_path = chart_dir / "images.yaml"
@@ -232,18 +417,9 @@ def main(definition_path: Path, output_dir: Path, dry_run: bool) -> None:
         print(f"ERROR: Definition file not found: {definition_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve output directory and common-lib relative path
-    # output_dir is where charts/ will be. 
-    # Example: REPO/projects/A/charts
-    # COMMON_LIB_PATH: REPO/helm-templates/common-lib
     CHARTS_DIR = output_dir.resolve()
     
-    # Calculate depth to get back to repo root from CHARTS_DIR/<app-name>
-    # From CHARTS_DIR/<app-name> to CHARTS_DIR is 1 level.
-    # From CHARTS_DIR to REPO_ROOT is N levels.
     try:
-        # We need relative path from output_dir / "any-app" to COMMON_LIB_PATH
-        # Using os.path.relpath is safer for cross-directory relatives
         import os
         dummy_app_path = CHARTS_DIR / "dummy-app"
         COMMON_LIB_REL = os.path.relpath(COMMON_LIB_PATH, dummy_app_path)
@@ -253,29 +429,45 @@ def main(definition_path: Path, output_dir: Path, dry_run: bool) -> None:
     with definition_path.open() as f:
         data = yaml.safe_load(f)
 
-    project = data.get("project", "unknown")
-    common_version = data.get("common_version", "1.0.0")
+    global_defaults = {
+        "project": data.get("project", "unknown"),
+        "common_version": data.get("common_version", "1.0.0"),
+        "namespace": data.get("namespace", "default"),
+        "image_repo": data.get("image_repo"),
+        "image_tag": data.get("image_tag"),
+        "imagePullSecrets": data.get("imagePullSecrets"),
+    }
     apps = data.get("apps", [])
 
+    # Load and parse variables.env if it exists in the same directory as definition
+    env_path = definition_path.parent / "variables.env"
+    project_vars = parse_env_file(env_path)
+    
     print(f"=== Helm Monorepo Generator ===")
-    print(f"Project        : {project}")
-    print(f"Common version : {common_version}")
-    print(f"Apps to process: {len(apps)}")
-    print(f"Dry-run mode   : {dry_run}")
-    print(f"Output dir     : {CHARTS_DIR}")
-    print(f"Common lib rel : {COMMON_LIB_REL}")
+    print(f"Project         : {global_defaults['project']}")
+    print(f"Environment Info: {env_path.name if env_path.exists() else 'None'}")
+    print(f"Config keys     : {len(project_vars[0])}")
+    print(f"Secret keys     : {len(project_vars[1])}")
+    print(f"Apps to process : {len(apps)}")
+    print(f"Dry-run mode    : {dry_run}")
+    print(f"Output dir      : {CHARTS_DIR}")
 
     if not apps:
         print("\nWARNING: No apps found in definition file. Nothing to generate.")
         return
 
-    for app in apps:
-        if "name" not in app or "type" not in app:
-            print(f"\nERROR: Skipping invalid app entry (missing 'name' or 'type'): {app}", file=sys.stderr)
-            continue
-        generate_chart(app, common_version, dry_run)
+    # 1. Generate shared resources chart if we have project variables
+    if project_vars[0] or project_vars[1]:
+        generate_shared_chart(global_defaults, project_vars, dry_run)
 
-    print(f"\n✅  Done. Generated {len(apps)} chart(s) in {CHARTS_DIR}/")
+    # 2. Generate each application chart
+    for app in apps:
+        if "name" not in app:
+            print(f"\nERROR: Skipping invalid app entry (missing 'name'): {app}", file=sys.stderr)
+            continue
+        generate_chart(app, global_defaults, project_vars, dry_run)
+
+    print(f"\n✅  Done. Generated resources in {CHARTS_DIR}/")
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +496,16 @@ examples:
         default=None,
         help=(
             "Sub-project name under the projects/ directory. "
-            "Auto-sets --definition to projects/NAME/apps_definition.yaml "
+            "Auto-sets --definition to projects/NAME/apps.<env>.yaml "
             "and --output-dir to projects/NAME/charts/. "
-            "Omit to use root-level apps_definition.yaml (single-project mode)."
+            "Omit to use root-level definition (single-project mode)."
         ),
+    )
+    parser.add_argument(
+        "--env",
+        metavar="ENV",
+        default="dev",
+        help="Environment name (e.g., dev, staging, prod). Defaults to 'dev'.",
     )
     parser.add_argument(
         "--definition",
@@ -329,12 +527,14 @@ examples:
     args = parser.parse_args()
 
     # Resolve paths based on --project shortcut or explicit overrides
+    definition_filename = f"apps.{args.env}.yaml"
+    
     if args.project:
         project_root = REPO_ROOT / "projects" / args.project
-        resolved_definition = args.definition or (project_root / "apps_definition.yaml")
+        resolved_definition = args.definition or (project_root / definition_filename)
         resolved_output = args.output_dir or (project_root / "charts")
     else:
-        resolved_definition = args.definition or APPS_DEFINITION_DEFAULT
+        resolved_definition = args.definition or (REPO_ROOT / definition_filename)
         resolved_output = args.output_dir or (REPO_ROOT / "charts")
 
     main(resolved_definition, resolved_output, args.dry_run)
