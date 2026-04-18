@@ -2,11 +2,13 @@
 ================================================================================
   common-lib/_ingress.yaml
   Reusable template that renders a Kubernetes Ingress resource.
+  
+  Per-path servicePort supports both port name (string) and port number (int).
+  If omitted, defaults to the first service port.
 ================================================================================
 */}}
 {{- define "common-lib.ingress" -}}
 {{- $fullName := include "common-lib.fullname" . -}}
-{{- $svcPort := .Values.service.port | default 80 -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -14,7 +16,7 @@ metadata:
   labels:
     {{- include "common-lib.labels" . | nindent 4 }}
   annotations:
-    {{- /* Nginx-specific default annotations if class is nginx or empty */}}
+    {{- /* Default Nginx annotations when className is 'nginx' (or not set) */}}
     {{- if eq (.Values.ingress.className | default "nginx") "nginx" }}
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
     nginx.ingress.kubernetes.io/proxy-body-size: "8m"
@@ -46,7 +48,16 @@ spec:
               service:
                 name: {{ $fullName }}
                 port:
-                  number: {{ $svcPort }}
+                  {{- /*
+                    Detect port type:
+                    - Integer (float64 in Go templates) → render as 'number'
+                    - String (port name like "http")    → render as 'name'
+                  */}}
+                  {{- if kindIs "float64" .servicePort }}
+                  number: {{ .servicePort | int }}
+                  {{- else }}
+                  name: {{ .servicePort | quote }}
+                  {{- end }}
           {{- end }}
     {{- end }}
 {{- end }}

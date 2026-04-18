@@ -69,14 +69,14 @@ try:
 except Exception as ex:
     results.append(test("secret envFrom", False, str(ex)))
 
-# Valid: raw
+# Valid: k8s (native K8s EnvVar)
 try:
-    e = EnvItem(raw={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}})
-    results.append(test("raw env", "name" in e.raw))
+    e = EnvItem(k8s={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}})
+    results.append(test("k8s env", "name" in e.k8s))
 except Exception as ex:
-    results.append(test("raw env", False, str(ex)))
+    results.append(test("k8s env", False, str(ex)))
 
-# Invalid: multiple sources
+# Invalid: multiple sources (name + k8s)
 try:
     e = EnvItem(name="X", configMap="Y")
     results.append(test("multiple sources → should fail", False, "No error raised"))
@@ -108,7 +108,7 @@ envs = [
     EnvItem(secretEnv="proj-secret", vars=["DB_PASS", "API_KEY"]),
     EnvItem(configMap="global-cm"),
     EnvItem(secret="ext-secret"),
-    EnvItem(raw={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}),
+    EnvItem(k8s={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}),
 ]
 env_list, env_from = build_env_items(envs)
 
@@ -119,7 +119,7 @@ results.append(test("secretEnv → API_KEY in env_list",
     any(e.get("name") == "API_KEY" for e in env_list)))
 results.append(test("configMap → envFrom", {"configMapRef": {"name": "global-cm"}} in env_from))
 results.append(test("secret → envFrom", {"secretRef": {"name": "ext-secret"}} in env_from))
-results.append(test("raw env in env_list", any(e.get("name") == "POD_IP" for e in env_list)))
+results.append(test("k8s env in env_list", any(e.get("name") == "POD_IP" for e in env_list)))
 
 
 # ===========================================================================
@@ -187,15 +187,15 @@ try:
 except Exception as ex:
     results.append(test("secret full spec dict", False, str(ex)))
 
-# Valid: raw
+# Valid: k8s escape hatch
 try:
-    v = VolumeItem(raw={
+    v = VolumeItem(k8s={
         "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
         "mount": {"mountPath": "/mnt/nfs", "readOnly": True},
     })
-    results.append(test("raw volume", "volume" in v.raw))
+    results.append(test("k8s volume", "volume" in v.k8s))
 except Exception as ex:
-    results.append(test("raw volume", False, str(ex)))
+    results.append(test("k8s volume", False, str(ex)))
 
 # Invalid: multiple sources
 try:
@@ -223,7 +223,7 @@ volumes = [
     VolumeItem(name="logs", mountPath="/var/log", hostPath="/var/log/nodes"),
     VolumeItem(name="cfg", mountPath="/etc/app", configMap="my-cm"),
     VolumeItem(name="certs", mountPath="/certs", secret="tls-secret"),
-    VolumeItem(raw={
+    VolumeItem(k8s={
         "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
         "mount": {"mountPath": "/mnt/nfs"},
     }),
@@ -244,9 +244,9 @@ results.append(test("configMap string → {name: cm}",
     any(v.get("configMap", {}).get("name") == "my-cm" for v in vol_specs)))
 results.append(test("secret string → {secretName: ...}",
     any(v.get("secret", {}).get("secretName") == "tls-secret" for v in vol_specs)))
-results.append(test("raw volume preserved",
+results.append(test("k8s volume preserved",
     any(v.get("name") == "nfs" and "nfs" in v for v in vol_specs)))
-results.append(test("raw mount has name from volume",
+results.append(test("k8s mount has name from volume",
     any(m.get("name") == "nfs" for m in mount_specs)))
 
 

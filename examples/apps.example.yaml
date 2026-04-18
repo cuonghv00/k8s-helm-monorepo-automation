@@ -67,13 +67,14 @@ apps:
       - secret: external-api-keys
 
       # Style 5: Raw K8s EnvVar spec (escape hatch for complex cases)
-      - raw:
+      # k8s: Native K8s EnvVar spec — for Downward API, resourceFieldRef, etc.
+      - k8s:
           name: POD_IP
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
 
-      - raw:
+      - k8s:
           name: POD_NAME
           valueFrom:
             fieldRef:
@@ -156,8 +157,8 @@ apps:
         mountPath: /run/secrets/token
         secret: api-token-secret
 
-      # Raw — full K8s Volume + VolumeMount spec (escape hatch)
-      - raw:
+      # k8s: Full K8s Volume + VolumeMount spec — NFS, CSI, Projected, etc.
+      - k8s:
           volume:
             name: nfs-archive
             nfs:

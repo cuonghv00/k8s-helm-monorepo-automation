@@ -134,7 +134,7 @@ class EnvItem(BaseModel):
       Per-key secret: secretEnv: secret-name, vars: [KEY1, KEY2]
       envFrom CM:     configMap: configmap-name
       envFrom Secret: secret: secret-name
-      Raw K8s spec:   raw: {name: ..., valueFrom: ...}
+      Native K8s:     k8s: {name: ..., valueFrom: ...}  # Full K8s EnvVar spec
     """
     model_config = ConfigDict(extra='forbid')
 
@@ -150,8 +150,8 @@ class EnvItem(BaseModel):
     configMap: Optional[str] = None
     secret: Optional[str] = None
 
-    # Raw K8s EnvVar manifest (escape hatch)
-    raw: Optional[dict] = None
+    # Native K8s EnvVar manifest (escape hatch for Downward API, resourceFieldRef, etc.)
+    k8s: Optional[dict] = None
 
     @model_validator(mode='after')
     def validate_source(self) -> 'EnvItem':
@@ -160,18 +160,18 @@ class EnvItem(BaseModel):
             self.secretEnv is not None,
             self.configMap is not None,
             self.secret is not None,
-            self.raw is not None,
+            self.k8s is not None,
         ])
         if sources == 0:
             raise ValueError(
                 "EnvItem must define exactly one source: "
-                "name/value, secretEnv(+vars), configMap, secret, or raw"
+                "name/value, secretEnv(+vars), configMap, secret, or k8s"
             )
         if sources > 1:
             raise ValueError(
                 f"EnvItem has multiple sources defined — only one is allowed. "
                 f"Found: name={self.name}, secretEnv={self.secretEnv}, "
-                f"configMap={self.configMap}, secret={self.secret}, raw={bool(self.raw)}"
+                f"configMap={self.configMap}, secret={self.secret}, k8s={bool(self.k8s)}"
             )
         if self.secretEnv is not None and not self.vars:
             raise ValueError("'secretEnv' requires a non-empty 'vars' list")
@@ -181,19 +181,19 @@ class EnvItem(BaseModel):
 class VolumeItem(BaseModel):
     """
     Unified volume config combining Volume source and VolumeMount in one entry.
-    Supported sources: pvc, emptyDir, hostPath, configMap, secret, raw.
+    Supported sources: pvc, emptyDir, hostPath, configMap, secret, k8s.
 
     Mount options (readOnly, mountPropagation, recursiveReadOnly) are
     applied to the VolumeMount spec.
 
-    For raw, use:
-      raw:
+    For native K8s manifest (escape hatch), use:
+      k8s:
         volume: {name: ..., <source_spec>: ...}
         mount:  {mountPath: ..., ...}
     """
     model_config = ConfigDict(extra='forbid')
 
-    # VolumeMount fields (required for non-raw)
+    # VolumeMount fields (required for non-k8s)
     name: Optional[str] = None
     mountPath: Optional[str] = None
     readOnly: Optional[bool] = None
@@ -206,31 +206,30 @@ class VolumeItem(BaseModel):
     hostPath: Optional[Union[str, dict]] = None     # "/path" or {path:, type:}
     configMap: Optional[Union[str, dict]] = None    # "cm-name" or {name:, items:}
     secret: Optional[Union[str, dict]] = None       # "sec-name" or {secretName:, items:}
-    raw: Optional[dict] = None                      # {volume: {...}, mount: {...}}
+    k8s: Optional[dict] = None                      # Native K8s: {volume: {...}, mount: {...}}
 
     @model_validator(mode='after')
     def validate_source(self) -> 'VolumeItem':
-        # Count defined sources
         sources = sum([
             self.pvc is not None,
             self.emptyDir is not None,
             self.hostPath is not None,
             self.configMap is not None,
             self.secret is not None,
-            self.raw is not None,
+            self.k8s is not None,
         ])
         if sources == 0:
             raise ValueError(
                 "VolumeItem must define exactly one source: "
-                "pvc, emptyDir, hostPath, configMap, secret, or raw"
+                "pvc, emptyDir, hostPath, configMap, secret, or k8s"
             )
         if sources > 1:
             raise ValueError("VolumeItem has multiple sources — only one is allowed")
-        if self.raw is None:
+        if self.k8s is None:
             if not self.name:
-                raise ValueError("'name' is required for non-raw volumes")
+                raise ValueError("'name' is required for non-k8s volumes")
             if not self.mountPath:
-                raise ValueError("'mountPath' is required for non-raw volumes")
+                raise ValueError("'mountPath' is required for non-k8s volumes")
         return self
 
 
@@ -363,9 +362,9 @@ def build_env_items(envs: list[EnvItem]) -> tuple[list, list]:
     env_from_list = []
 
     for item in envs:
-        if item.raw is not None:
-            # Escape hatch: raw K8s EnvVar spec
-            env_list.append(item.raw)
+        if item.k8s is not None:
+            # Native K8s EnvVar spec (Downward API, resourceFieldRef, etc.)
+            env_list.append(item.k8s)
 
         elif item.secretEnv is not None:
             # Per-key secretKeyRef injection
@@ -410,17 +409,17 @@ def build_volume_items(volumes: list[VolumeItem]) -> tuple[list, list]:
     mount_specs = []
 
     for item in volumes:
-        if item.raw is not None:
-            # Escape hatch: raw K8s Volume + VolumeMount
-            raw_vol = dict(item.raw.get("volume", {}))
-            raw_mount = dict(item.raw.get("mount", {}))
-            if not raw_vol:
-                raise ValueError("raw volume item must have a non-empty 'volume' key")
-            if "name" not in raw_vol:
-                raise ValueError("raw volume 'volume' dict must include 'name'")
-            raw_mount["name"] = raw_vol["name"]
-            volume_specs.append(raw_vol)
-            mount_specs.append(raw_mount)
+        if item.k8s is not None:
+            # Native K8s Volume + VolumeMount spec (NFS, CSI, projected, etc.)
+            k8s_vol = dict(item.k8s.get("volume", {}))
+            k8s_mount = dict(item.k8s.get("mount", {}))
+            if not k8s_vol:
+                raise ValueError("k8s volume item must have a non-empty 'volume' key")
+            if "name" not in k8s_vol:
+                raise ValueError("k8s volume 'volume' dict must include 'name'")
+            k8s_mount["name"] = k8s_vol["name"]
+            volume_specs.append(k8s_vol)
+            mount_specs.append(k8s_mount)
             continue
 
         # --- Build VolumeMount ---
