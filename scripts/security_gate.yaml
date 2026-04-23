@@ -1,0 +1,208 @@
+.security_gate_base:
+  stage: gate
+
+  image: itapp-registry.fsoft.com.vn/devsecops/alpine:3.23
+
+  variables:
+    GIT_DEPTH: "0"
+
+  needs:
+    - job: scan_image
+      artifacts: true
+    - job: secret_detect
+      artifacts: true
+    - job: sonarqube
+      artifacts: false
+
+  before_script:
+    - |
+      set -euo pipefail
+      apk add --no-cache bash curl jq git
+      git fetch origin master --tags || true
+      git fetch origin main --tags || true
+      git fetch origin '+refs/heads/hotfix-*:refs/remotes/origin/hotfix-*' || true
+
+  script:
+    - |
+      set -euo pipefail
+
+      echo "=== Security Gate Context ==="
+      echo "CI_COMMIT_SHA=${CI_COMMIT_SHA}"
+      echo "CI_COMMIT_BRANCH=${CI_COMMIT_BRANCH:-}"
+      echo "CI_COMMIT_TAG=${CI_COMMIT_TAG:-}"
+      echo "CI_PIPELINE_SOURCE=${CI_PIPELINE_SOURCE:-}"
+      echo "TRIVY_RESULT=${TRIVY_RESULT:-unset}"
+      echo "GITLEAKS_RESULT=${GITLEAKS_RESULT:-unset}"
+
+      # --- 1. Resolve Sonar branch and derive GATE_POLICY from ref context ---
+      # GATE_POLICY is derived from CI_COMMIT_BRANCH / CI_COMMIT_TAG — predefined
+      # GitLab variables that cannot be overridden by manually triggered pipeline
+      # variables. Any externally passed GATE_POLICY value is silently ignored.
+      SONAR_BRANCH=""
+      GATE_POLICY=""
+
+      # Returns true if CI_COMMIT_SHA is reachable from branch_ref
+      _commit_in_branch() {
+        local branch_ref="$1"
+        local branch_name="${branch_ref#origin/}"
+        git rev-parse --verify "${branch_ref}^{commit}" >/dev/null 2>&1 \
+          && git branch -r --contains "${CI_COMMIT_SHA}" \
+             | sed 's/^[[:space:]]*//' \
+             | grep -qxF "origin/${branch_name}"
+      }
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        GATE_POLICY="block"
+
+        if echo "$CI_COMMIT_TAG" | grep -Eq '^hotfix-'; then
+          if _commit_in_branch "origin/main"; then
+            SONAR_BRANCH="main"
+          elif _commit_in_branch "origin/master"; then
+            SONAR_BRANCH="master"
+          else
+            HOTFIX_BRANCH="$(git branch -r --contains "${CI_COMMIT_SHA}" \
+              | sed 's/^[[:space:]]*//' \
+              | grep -E '^origin/hotfix-' \
+              | head -n1 \
+              | sed 's#^origin/##' || true)"
+            if [ -n "$HOTFIX_BRANCH" ]; then
+              SONAR_BRANCH="$HOTFIX_BRANCH"
+            fi
+          fi
+
+          if [ -z "$SONAR_BRANCH" ]; then
+            echo "ERROR: Cannot resolve Sonar branch for hotfix tag '${CI_COMMIT_TAG}'"
+            exit 1
+          fi
+
+        else
+          if _commit_in_branch "origin/main"; then
+            SONAR_BRANCH="main"
+          elif _commit_in_branch "origin/master"; then
+            SONAR_BRANCH="master"
+          else
+            echo "ERROR: Tag '${CI_COMMIT_TAG}' is not created from main/master"
+            exit 1
+          fi
+        fi
+
+      elif [ -n "${CI_COMMIT_BRANCH:-}" ]; then
+        case "$CI_COMMIT_BRANCH" in
+          develop)
+            GATE_POLICY="warn"
+            SONAR_BRANCH="develop"
+            ;;
+          main|master)
+            GATE_POLICY="block"
+            SONAR_BRANCH="$CI_COMMIT_BRANCH"
+            ;;
+          *)
+            echo "INFO: Branch '$CI_COMMIT_BRANCH' is not in security-gate scope. Skipping."
+            exit 0
+            ;;
+        esac
+
+      else
+        echo "ERROR: Unknown pipeline ref type"
+        exit 1
+      fi
+
+      echo "GATE_POLICY=${GATE_POLICY} (ref-derived)"
+      echo "Resolved Sonar branch: ${SONAR_BRANCH}"
+
+      # --- Admin bypass (global — affects all gates in this pipeline run) ---
+      # Requirements:
+      #   1. CI_PIPELINE_SOURCE=schedule — predefined GitLab variable, cannot be
+      #      injected by a developer triggering a pipeline manually from the UI.
+      #      Only Maintainer+ can create/edit scheduled pipelines.
+      #   2. GATE_BYPASS_REASON must be non-empty and should contain a ticket
+      #      reference and expiry date for audit purposes.
+      # Effect: overrides GATE_POLICY to "warn" for ALL gate jobs in this pipeline.
+      if [ -n "${GATE_BYPASS_REASON:-}" ]; then
+        if [ "${CI_PIPELINE_SOURCE:-}" = "schedule" ]; then
+          echo "========================================="
+          echo "SECURITY GATE BYPASS ACTIVE"
+          echo "Triggered by:    ${GITLAB_USER_LOGIN:-scheduler}"
+          echo "Pipeline:        ${CI_PIPELINE_URL:-}"
+          echo "Original policy: ${GATE_POLICY}"
+          echo "Bypass reason:   ${GATE_BYPASS_REASON}"
+          echo "========================================="
+          GATE_POLICY="warn"
+        else
+          echo "INFO: GATE_BYPASS_REASON is set but CI_PIPELINE_SOURCE='${CI_PIPELINE_SOURCE:-}' is not 'schedule'. Bypass ignored."
+        fi
+      fi
+
+      # --- 2. Query SonarQube Quality Gate ---
+      SONAR_BRANCH_ENCODED="${SONAR_BRANCH//\//%2F}"
+      SONAR_API_URL="${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT}&branch=${SONAR_BRANCH_ENCODED}"
+      SONAR_RESP_FILE="sonar-response-${CI_JOB_ID}.json"
+
+      NETRC_FILE="$(mktemp)"
+      chmod 600 "${NETRC_FILE}"
+      SONAR_HOST="$(echo "${SONAR_HOST_URL}" | sed 's|https\?://||' | cut -d/ -f1)"
+      printf 'machine %s\nlogin %s\npassword \n' "${SONAR_HOST}" "${SONAR_TOKEN}" > "${NETRC_FILE}"
+
+      HTTP_CODE="$(curl -sS \
+        --connect-timeout 10 \
+        --max-time 30 \
+        --netrc-file "${NETRC_FILE}" \
+        -o "${SONAR_RESP_FILE}" \
+        -w "%{http_code}" \
+        "${SONAR_API_URL}")" || true
+
+      rm -f "${NETRC_FILE}"
+
+      if [ "${HTTP_CODE}" != "200" ]; then
+        echo "ERROR: Sonar API returned HTTP ${HTTP_CODE}:"
+        cat "${SONAR_RESP_FILE}" 2>/dev/null || true
+        SONAR_STATUS="HTTP_${HTTP_CODE}"
+        SONAR_OK="fail"
+      else
+        SONAR_STATUS="$(jq -r '.projectStatus.status // "UNKNOWN"' "${SONAR_RESP_FILE}")"
+
+        case "${SONAR_STATUS}" in
+          OK)
+            SONAR_OK="pass"
+            ;;
+          WARN)
+            echo "WARN: SonarQube status is WARN (legacy threshold). Treating as pass."
+            SONAR_OK="pass"
+            ;;
+          ERROR)
+            SONAR_OK="fail"
+            ;;
+          NONE)
+            echo "WARN: SonarQube project has no analysis yet."
+            SONAR_OK="fail"
+            ;;
+          *)
+            echo "WARN: Unexpected SonarQube status: '${SONAR_STATUS}'"
+            SONAR_OK="fail"
+            ;;
+        esac
+      fi
+
+      echo "Sonar Quality Gate status: ${SONAR_STATUS}"
+
+      # --- 3. Aggregate results ---
+      FAIL_REASONS=""
+
+      [ "${TRIVY_RESULT:-fail}"    = "pass" ] || FAIL_REASONS="${FAIL_REASONS} TRIVY_RESULT=fail;"
+      [ "${GITLEAKS_RESULT:-fail}" = "pass" ] || FAIL_REASONS="${FAIL_REASONS} GITLEAKS_RESULT=fail;"
+      [ "${SONAR_OK}"              = "pass" ] || FAIL_REASONS="${FAIL_REASONS} SONAR_QG=${SONAR_STATUS};"
+
+      if [ -n "${FAIL_REASONS}" ]; then
+        if [ "${GATE_POLICY}" = "block" ]; then
+          echo "SECURITY GATE BLOCKED: ${FAIL_REASONS}"
+          exit 1
+        else
+          echo "SECURITY WARNING: ${FAIL_REASONS}"
+          exit 0
+        fi
+      fi
+
+      echo "SECURITY GATE PASSED"
+
+  after_script:
+    - rm -f "sonar-response-${CI_JOB_ID}.json" 2>/dev/null || true
